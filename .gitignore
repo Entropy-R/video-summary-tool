@@ -1,0 +1,8 @@
+.env
+.docker-config/
+outputs/
+cookies/
+__pycache__/
+*.pyc
+.venv/
+venv/

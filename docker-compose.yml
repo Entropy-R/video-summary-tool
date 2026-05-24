@@ -1,0 +1,20 @@
+services:
+  video-summary:
+    build: .
+    image: video-summary:local
+    working_dir: /app
+    environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      VIDEO_SUMMARY_COOKIES: ${VIDEO_SUMMARY_COOKIES:-}
+      VIDEO_SUMMARY_COOKIES_FROM_BROWSER: ${VIDEO_SUMMARY_COOKIES_FROM_BROWSER:-}
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /cache/huggingface
+    volumes:
+      - ./outputs:/app/outputs
+      - ./cookies:/app/cookies
+      - video_summary_cache:/cache
+
+volumes:
+  video_summary_cache:
