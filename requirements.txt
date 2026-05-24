@@ -1,0 +1,4 @@
+yt-dlp>=2025.5.22
+faster-whisper>=1.1.1
+openai>=1.82.0
+python-dotenv>=1.1.0
