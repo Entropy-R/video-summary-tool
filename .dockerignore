@@ -1,10 +1,15 @@
 .env
+.DS_Store
 .git/
 .docker-config/
 .venv/
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
 outputs/
 cookies/
 .cache/
