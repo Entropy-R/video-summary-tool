@@ -422,6 +422,10 @@ docker compose run --rm video-summary "/app/outputs/local/sample.mp4" --model-si
 - B 站链接可能需要 cookies、代理或换网络。
 - `.env`、`cookies/`、`outputs/` 已加入忽略列表，避免误提交敏感数据或产物。
 
+## 版本变更
+
+README 主要说明当前版本的安装和使用方式。各版本之间的功能变化、升级说明和历史记录统一维护在 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 开源协议
 
 MIT License。详见 `LICENSE`。
