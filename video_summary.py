@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -17,6 +18,7 @@ from dotenv import load_dotenv
 SUBTITLE_EXTS = (".srt", ".vtt", ".ass", ".json3", ".srv1", ".srv2", ".srv3", ".ttml")
 AUDIO_EXTS = (".mp3", ".m4a", ".opus", ".wav", ".webm")
 DEFAULT_COOKIES_PATH = "/app/cookies/cookies.txt"
+GENERATED_OUTPUT_FILES = ("transcript.txt", "summary.md", "chatgpt_prompt.md")
 AVAILABLE_MODEL_SIZES = (
     "tiny",
     "tiny.en",
@@ -40,14 +42,42 @@ DEFAULT_PROMPT_TEMPLATE = """你是严谨的视频内容总结助手。请只基
 
 视频标题：{title}
 文本来源：{source}
+文本质量提醒：{transcript_quality_note}
 
 请按以下格式输出：
 
 ## 视频主题
+用一段话概括视频整体内容。
+
 ## 核心观点
+
 ## 分段要点
+按转写文本中的时间节点组织，每个节点写出稍详细的内容要点。只能使用原文已有的时间节点，不要自行编造时间。
+
 ## 重要结论
+
 ## 可执行建议
+
+这是第 {chunk_index}/{chunk_count} 段转写文本：
+
+{transcript}
+"""
+CHUNK_SUMMARY_TEMPLATE = """你是严谨的视频内容总结助手。请只基于给定转写文本，提取这一段的结构化要点，不要编造原文没有的信息。
+
+视频标题：{title}
+文本来源：{source}
+文本质量提醒：{transcript_quality_note}
+
+请输出：
+
+## 本段主题
+用一两句话概括这一段内容。
+
+## 本段时间节点与要点
+按转写文本中的时间节点组织，保留原文已有时间节点；每个节点写出稍详细的事实、观点、步骤或例子。不要自行编造时间。
+
+## 本段重要细节
+列出后续合并总结时不能丢失的关键细节、术语、工具名、参数或限制。
 
 这是第 {chunk_index}/{chunk_count} 段转写文本：
 
@@ -62,6 +92,9 @@ class VideoMeta:
     webpage_url: str
     uploader: str | None = None
     duration: int | None = None
+    description: str | None = None
+    tags: list[str] = field(default_factory=list)
+    categories: list[str] = field(default_factory=list)
     subtitle_langs: list[str] = field(default_factory=list)
     automatic_caption_langs: list[str] = field(default_factory=list)
 
@@ -174,6 +207,12 @@ def with_cookies(args: list[str], cookies: CookieConfig | None) -> list[str]:
     return args[:1] + injected + args[1:] if injected else args
 
 
+def string_list(value) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+
+
 def load_meta(url: str, workdir: Path, cookies: CookieConfig | None) -> VideoMeta:
     args = with_cookies(["yt-dlp", "--dump-single-json", "--no-playlist", url], cookies)
     result = run_command(args, workdir)
@@ -188,6 +227,9 @@ def load_meta(url: str, workdir: Path, cookies: CookieConfig | None) -> VideoMet
         webpage_url=data.get("webpage_url") or url,
         uploader=data.get("uploader") or data.get("channel"),
         duration=data.get("duration"),
+        description=data.get("description") if isinstance(data.get("description"), str) else None,
+        tags=string_list(data.get("tags")),
+        categories=string_list(data.get("categories")),
         subtitle_langs=sorted((data.get("subtitles") or {}).keys()),
         automatic_caption_langs=sorted((data.get("automatic_captions") or {}).keys()),
     )
@@ -207,14 +249,125 @@ def write_meta(
     output_dir: Path,
     transcript_source: str | None = None,
     warnings: list[str] | None = None,
+    processing: dict | None = None,
+    options: dict | None = None,
+    whisper_context_terms: list[str] | None = None,
 ) -> None:
     data = asdict(meta)
+    data.pop("description", None)
+    data.pop("tags", None)
+    data.pop("categories", None)
     data["transcript_source"] = transcript_source
     data["warnings"] = warnings or []
+    if whisper_context_terms is not None:
+        data["whisper_context_terms"] = whisper_context_terms
+    if processing is not None:
+        data["processing"] = processing
+    if options is not None:
+        data["options"] = options
     (output_dir / "meta.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def clean_generated_outputs(output_dir: Path) -> None:
+    for name in GENERATED_OUTPUT_FILES:
+        (output_dir / name).unlink(missing_ok=True)
+
+
+def mark_stage(processing: dict, stage: str, started_at: float) -> None:
+    processing.setdefault("stages", {})[stage] = round(time.monotonic() - started_at, 3)
+
+
+def mark_total(processing: dict, started_at: float) -> None:
+    processing["total_seconds"] = round(time.monotonic() - started_at, 3)
+
+
+def build_processing_info(args: argparse.Namespace, whisper_language: str | None) -> tuple[dict, dict]:
+    processing = {
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "stages": {},
+    }
+    options = {
+        "model_size": args.model_size,
+        "language": args.language,
+        "normalized_language": whisper_language,
+        "sub_langs": args.sub_langs,
+        "max_chars": args.max_chars,
+        "force_transcribe": args.force_transcribe,
+        "keep_audio": args.keep_audio,
+        "no_llm": args.no_llm,
+        "export_prompt": args.export_prompt or bool(args.summary_from_file),
+        "summary_from_file": bool(args.summary_from_file),
+    }
+    return processing, options
+
+
+def maybe_warn_language(meta: VideoMeta, requested_language: str | None, warnings: list[str]) -> None:
+    if requested_language != "zh":
+        return
+    latin_terms = re.findall(r"[A-Za-z][A-Za-z0-9.+_-]*", meta.title)
+    if len(latin_terms) >= 3:
+        warnings.append("标题包含较多英文术语；如果视频主要是英文，建议使用 --language en 或 --language auto 提升 Whisper 识别质量。")
+
+
+def normalize_context_term(value: str) -> str:
+    value = re.sub(r"https?://\S+", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n,，。.!！?？:：;；()（）[]【】<>《》\"'")
+    return value.strip()
+
+
+def add_context_term(terms: list[str], seen: set[str], value: str, max_total_chars: int) -> None:
+    term = normalize_context_term(value)
+    if len(term) < 2 or len(term) > 60:
+        return
+    key = term.casefold()
+    if key in seen:
+        return
+    if any(key != item.casefold() and key in item.casefold() for item in terms):
+        return
+    current_len = sum(len(item) + 2 for item in terms)
+    if current_len + len(term) > max_total_chars:
+        return
+    terms.append(term)
+    seen.add(key)
+
+
+def extract_context_terms_from_text(text: str, terms: list[str], seen: set[str], max_total_chars: int) -> None:
+    if not text:
+        return
+
+    # 优先抓取标题和简介中显式出现的英文、数字、连字符、版本号等专有词。
+    patterns = [
+        r"\b[A-Za-z][A-Za-z0-9]*(?:[.+_-][A-Za-z0-9]+)+\b",
+        r"\b[A-Za-z]*[A-Z][A-Za-z0-9]*(?:\s+[A-Za-z]*[A-Z][A-Za-z0-9]*){0,2}\b",
+        r"\b[A-Za-z]+(?:\s+[A-Z][A-Za-z0-9]+){1,2}\b",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            add_context_term(terms, seen, match.group(0), max_total_chars)
+
+
+def build_whisper_context_terms(meta: VideoMeta, max_total_chars: int = 800) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+
+    for text in (meta.title, meta.uploader or "", meta.description or ""):
+        extract_context_terms_from_text(text, terms, seen, max_total_chars)
+
+    # tags/categories 本身通常已经是平台给出的关键词，保守收取短项即可。
+    for item in [*meta.tags[:12], *meta.categories[:8]]:
+        if len(item) <= 30:
+            add_context_term(terms, seen, item, max_total_chars)
+
+    return terms
+
+
+def build_whisper_initial_prompt(terms: list[str]) -> str | None:
+    if not terms:
+        return None
+    return "视频元数据中出现的关键词包括：" + "、".join(terms)
 
 
 def detect_subtitle_source(path: Path, meta: VideoMeta) -> tuple[str, list[str]]:
@@ -318,6 +471,10 @@ def clean_subtitle(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix == ".json3":
         return clean_json3(path)
+    if suffix == ".srt":
+        return clean_srt(path)
+    if suffix == ".vtt":
+        return clean_vtt(path)
     if suffix in (".srv1", ".srv2", ".srv3", ".ttml"):
         text = path.read_text(encoding="utf-8", errors="ignore")
         text = re.sub(r"<[^>]+>", "\n", text)
@@ -336,13 +493,79 @@ def clean_subtitle(path: Path) -> str:
     return normalize_lines(cleaned)
 
 
+def format_timestamp(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def parse_subtitle_timestamp(value: str) -> str | None:
+    match = re.match(r"(?:(\d+):)?(\d{1,2}):(\d{2})(?:[,.](\d{1,3}))?", value.strip())
+    if not match:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    seconds = int(match.group(3))
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def clean_subtitle_text(value: str) -> str:
+    value = re.sub(r"<[^>]+>", "", value)
+    value = re.sub(r"\{\\.*?\}", "", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def format_timed_line(timestamp: str, text: str) -> str:
+    return f"[{timestamp}] {text}"
+
+
+def clean_srt(path: Path) -> str:
+    content = path.read_text(encoding="utf-8-sig", errors="ignore").replace("\r\n", "\n")
+    entries: list[str] = []
+    for block in re.split(r"\n{2,}", content):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        time_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
+        if time_index is None:
+            continue
+        timestamp = parse_subtitle_timestamp(lines[time_index].split("-->", 1)[0])
+        text = clean_subtitle_text(" ".join(lines[time_index + 1 :]))
+        if timestamp and text:
+            entries.append(format_timed_line(timestamp, text))
+    return normalize_lines(entries)
+
+
+def clean_vtt(path: Path) -> str:
+    content = path.read_text(encoding="utf-8-sig", errors="ignore").replace("\r\n", "\n")
+    entries: list[str] = []
+    for block in re.split(r"\n{2,}", content):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines or lines[0].startswith("WEBVTT"):
+            continue
+        time_index = next((index for index, line in enumerate(lines) if "-->" in line), None)
+        if time_index is None:
+            continue
+        timestamp = parse_subtitle_timestamp(lines[time_index].split("-->", 1)[0])
+        # VTT cue settings 跟在时间行后，清洗文本时只保留字幕正文。
+        text = clean_subtitle_text(" ".join(lines[time_index + 1 :]))
+        if timestamp and text:
+            entries.append(format_timed_line(timestamp, text))
+    return normalize_lines(entries)
+
+
 def clean_json3(path: Path) -> str:
     data = json.loads(path.read_text(encoding="utf-8"))
     lines: list[str] = []
     for event in data.get("events", []):
         parts = event.get("segs") or []
-        text = "".join(part.get("utf8", "") for part in parts).strip()
-        if text:
+        text = clean_subtitle_text("".join(part.get("utf8", "") for part in parts))
+        start_ms = event.get("tStartMs")
+        if text and isinstance(start_ms, int):
+            lines.append(format_timed_line(format_timestamp(start_ms / 1000), text))
+        elif text:
             lines.append(text)
     return normalize_lines(lines)
 
@@ -360,13 +583,27 @@ def normalize_lines(lines: Iterable[str]) -> str:
     return text + "\n" if text else ""
 
 
-def transcribe_audio(audio_path: Path, model_size: str, language: str | None = None) -> str:
+def transcribe_audio(
+    audio_path: Path,
+    model_size: str,
+    language: str | None = None,
+    initial_prompt: str | None = None,
+) -> str:
     from faster_whisper import WhisperModel
 
     # 使用 auto 让同一镜像可以兼容 CPU/GPU 环境；模型大小由 CLI 参数控制。
     model = WhisperModel(model_size, device="auto", compute_type="auto")
-    segments, _info = model.transcribe(str(audio_path), language=language, vad_filter=True)
-    lines = [segment.text.strip() for segment in segments if segment.text.strip()]
+    segments, _info = model.transcribe(
+        str(audio_path),
+        language=language,
+        vad_filter=True,
+        initial_prompt=initial_prompt,
+    )
+    lines = [
+        format_timed_line(format_timestamp(segment.start), segment.text.strip())
+        for segment in segments
+        if segment.text.strip()
+    ]
     return normalize_lines(lines)
 
 
@@ -428,6 +665,30 @@ def validate_model_size(value: str) -> str:
     return value
 
 
+def base_transcript_source(source: str) -> str:
+    suffix = "_partials"
+    return source[: -len(suffix)] if source.endswith(suffix) else source
+
+
+def transcript_quality_note(source: str) -> str:
+    source = base_transcript_source(source)
+    if source == "whisper":
+        return (
+            "本文本由 Whisper 音频转写生成，可能存在专有名词、英文术语、产品名、人名、数字、标点和断句错误。"
+            "请结合上下文只修正明显误识别；无法确定时保守表述，不要编造原文没有的信息。"
+        )
+    if source == "auto_subtitle":
+        return (
+            "本文本来自平台自动字幕，可能存在自动识别错误。"
+            "请结合上下文只修正明显误识别；无法确定时保守表述，不要编造原文没有的信息。"
+        )
+    if source == "manual_subtitle":
+        return "本文本来自人工字幕，通常较可靠，但仍可能存在错字、漏字或排版问题；请只基于原文总结。"
+    if source == "file":
+        return "本文本来自已有转写稿，来源质量未知；如遇疑似识别错误，请结合上下文保守理解，不要编造。"
+    return "转写文本可能存在识别、清洗或断句错误；请结合上下文保守总结，不要编造原文没有的信息。"
+
+
 def render_prompt_template(
     template: str,
     transcript: str,
@@ -445,6 +706,7 @@ def render_prompt_template(
         "webpage_url": meta.webpage_url,
         "uploader": meta.uploader or "",
         "duration": "" if meta.duration is None else str(meta.duration),
+        "transcript_quality_note": transcript_quality_note(source),
     }
     try:
         return template.format(**values)
@@ -452,8 +714,28 @@ def render_prompt_template(
         raise AppError(
             "invalid_prompt_template",
             f"prompt 模板包含未知变量：{exc.args[0]}",
-            ["支持变量：{title}、{source}、{transcript}、{chunk_index}、{chunk_count}、{webpage_url}、{uploader}、{duration}"],
+            [
+                "支持变量：{title}、{source}、{transcript}、{chunk_index}、{chunk_count}、"
+                "{webpage_url}、{uploader}、{duration}、{transcript_quality_note}"
+            ],
         ) from exc
+
+
+def render_chunk_summary_prompt(
+    transcript: str,
+    meta: VideoMeta,
+    source: str,
+    chunk_index: int,
+    chunk_count: int,
+) -> str:
+    return render_prompt_template(
+        CHUNK_SUMMARY_TEMPLATE,
+        transcript,
+        meta,
+        source,
+        chunk_index,
+        chunk_count,
+    )
 
 
 def summarize_with_llm(
@@ -479,11 +761,16 @@ def summarize_with_llm(
     )
     model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     chunks = split_text(transcript, max_chars)
+    if len(chunks) == 1:
+        prompt = render_prompt_template(prompt_template, chunks[0], meta, source, 1, 1)
+        try:
+            return call_llm(client, model, prompt)
+        except Exception as exc:
+            raise classify_llm_error(exc) from exc
 
     partials: list[str] = []
     for index, chunk in enumerate(chunks, start=1):
-        prompt = render_prompt_template(
-            prompt_template,
+        prompt = render_chunk_summary_prompt(
             chunk,
             meta,
             source,
@@ -495,6 +782,7 @@ def summarize_with_llm(
         except Exception as exc:
             raise classify_llm_error(exc) from exc
 
+    # 多段长文本先提取细节，再由最终模板合并，减少直接二次压缩造成的要点丢失。
     final_prompt = render_prompt_template(
         prompt_template,
         "\n\n".join(partials),
@@ -581,7 +869,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("url", nargs="?", help="视频链接，或容器/本机可访问的本地音视频文件路径")
     parser.add_argument("--output", default="outputs", help="输出目录，默认 outputs")
     parser.add_argument("--model-size", default="small", choices=AVAILABLE_MODEL_SIZES, help="faster-whisper 模型大小，默认 small")
-    parser.add_argument("--language", default="zh", help="Whisper 识别语言，例如 zh、en、auto；默认 zh")
+    parser.add_argument("--language", default="zh", help="Whisper 识别语言；中文视频用 zh，英文视频建议 en，不确定可用 auto；默认 zh")
     parser.add_argument("--sub-langs", default="zh-Hans,zh-CN,zh,en", help="字幕语言优先级")
     parser.add_argument("--cookies", default=None, help="cookies.txt 路径；默认自动尝试 /app/cookies/cookies.txt，缺失时忽略")
     parser.add_argument("--force-transcribe", action="store_true", help="跳过字幕，强制下载音频并转写")
@@ -598,16 +886,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    run_started = time.monotonic()
     load_dotenv()
     args = parse_args()
     prompt_template = load_prompt_template(args.prompt, args.prompt_file)
     whisper_language = normalize_language(args.language)
+    processing, options = build_processing_info(args, whisper_language)
     output_dir: Path | None = None
     transcript_path: Path | None = None
     prompt_path: Path | None = None
     summary_path: Path | None = None
     meta: VideoMeta | None = None
     transcript_source: str | None = None
+    whisper_context_terms: list[str] | None = None
     warnings: list[str] = []
 
     try:
@@ -630,11 +921,16 @@ def main() -> int:
             )
             output_dir = output_root / safe_name(meta.title)
             output_dir.mkdir(parents=True, exist_ok=True)
+            clean_generated_outputs(output_dir)
             transcript_path = output_dir / "transcript.txt"
             transcript_path.write_text(transcript, encoding="utf-8")
             transcript_source = "file"
-            write_meta(meta, output_dir, transcript_source)
+            write_meta(meta, output_dir, transcript_source, warnings, processing, options)
+            stage_started = time.monotonic()
             prompt_path = write_chatgpt_prompt(transcript, meta, "file", output_dir, args.max_chars, prompt_template)
+            mark_stage(processing, "export_prompt", stage_started)
+            mark_total(processing, run_started)
+            write_meta(meta, output_dir, transcript_source, warnings, processing, options)
             if args.json:
                 print_json(
                     {
@@ -661,41 +957,71 @@ def main() -> int:
         if not is_local_file:
             require_tool("yt-dlp")
 
+        stage_started = time.monotonic()
         meta = load_local_meta(local_input) if is_local_file else load_meta(args.url, output_root, cookies)
+        mark_stage(processing, "load_meta", stage_started)
+        maybe_warn_language(meta, args.language, warnings)
         output_dir = output_root / (safe_name(meta.title) if is_local_file else safe_name(f"{meta.id}-{meta.title}"))
         output_dir.mkdir(parents=True, exist_ok=True)
-        write_meta(meta, output_dir)
+        clean_generated_outputs(output_dir)
+        write_meta(meta, output_dir, None, warnings, processing, options)
 
         subtitle_path = None
         if is_local_file:
-            transcript = transcribe_audio(local_input, args.model_size, whisper_language)
+            stage_started = time.monotonic()
+            whisper_context_terms = build_whisper_context_terms(meta)
+            transcript = transcribe_audio(
+                local_input,
+                args.model_size,
+                whisper_language,
+                build_whisper_initial_prompt(whisper_context_terms),
+            )
+            mark_stage(processing, "transcribe", stage_started)
             transcript_source = "whisper"
         elif not args.force_transcribe:
+            stage_started = time.monotonic()
             subtitle_info = download_subtitle(args.url, output_dir, cookies, args.sub_langs, meta)
+            mark_stage(processing, "download_subtitle", stage_started)
             if subtitle_info:
                 subtitle_path, transcript_source, subtitle_warnings = subtitle_info
                 warnings.extend(subtitle_warnings)
 
         if not is_local_file and subtitle_path:
+            stage_started = time.monotonic()
             transcript = clean_subtitle(subtitle_path)
+            mark_stage(processing, "clean_subtitle", stage_started)
             if not transcript.strip():
                 print("字幕文件为空，将尝试音频转写。", file=sys.stderr)
                 warnings.append("字幕文件为空，已回退到 Whisper 转写。")
                 subtitle_path = None
 
         if not is_local_file and not subtitle_path:
+            stage_started = time.monotonic()
             audio_path = download_audio(args.url, output_dir, cookies)
-            transcript = transcribe_audio(audio_path, args.model_size, whisper_language)
+            mark_stage(processing, "download_audio", stage_started)
+            stage_started = time.monotonic()
+            whisper_context_terms = build_whisper_context_terms(meta)
+            transcript = transcribe_audio(
+                audio_path,
+                args.model_size,
+                whisper_language,
+                build_whisper_initial_prompt(whisper_context_terms),
+            )
+            mark_stage(processing, "transcribe", stage_started)
             transcript_source = "whisper"
             if not args.keep_audio:
                 audio_path.unlink(missing_ok=True)
 
         transcript_path = output_dir / "transcript.txt"
         transcript_path.write_text(transcript, encoding="utf-8")
-        write_meta(meta, output_dir, transcript_source, warnings)
+        write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
 
         if args.export_prompt:
+            stage_started = time.monotonic()
             prompt_path = write_chatgpt_prompt(transcript, meta, transcript_source, output_dir, args.max_chars, prompt_template)
+            mark_stage(processing, "export_prompt", stage_started)
+            mark_total(processing, run_started)
+            write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
             if args.json:
                 print_json(
                     {
@@ -712,6 +1038,8 @@ def main() -> int:
             return 0
 
         if args.no_llm:
+            mark_total(processing, run_started)
+            write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
             if args.json:
                 print_json(
                     {
@@ -726,9 +1054,13 @@ def main() -> int:
                 print(f"已生成转写稿：{transcript_path}")
             return 0
 
+        stage_started = time.monotonic()
         summary = summarize_with_llm(transcript, meta, transcript_source, args.max_chars, prompt_template)
+        mark_stage(processing, "summarize", stage_started)
         summary_path = output_dir / "summary.md"
         summary_path.write_text(summary.strip() + "\n", encoding="utf-8")
+        mark_total(processing, run_started)
+        write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
         if args.json:
             print_json(
                 {
@@ -746,6 +1078,7 @@ def main() -> int:
     except AppError as exc:
         if output_dir and transcript_path and transcript_path.exists() and not prompt_path:
             try:
+                stage_started = time.monotonic()
                 prompt_path = write_chatgpt_prompt(
                     transcript_path.read_text(encoding="utf-8"),
                     meta or VideoMeta(title="video", id="video", webpage_url=""),
@@ -754,7 +1087,14 @@ def main() -> int:
                     args.max_chars,
                     prompt_template,
                 )
+                mark_stage(processing, "export_prompt", stage_started)
                 exc.hints.append(f"已自动生成 ChatGPT 提示词，可复制到 ChatGPT：{prompt_path}")
+            except Exception:
+                pass
+        if output_dir and meta:
+            try:
+                mark_total(processing, run_started)
+                write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
             except Exception:
                 pass
         if args.json:
@@ -780,6 +1120,7 @@ def main() -> int:
     except Exception as exc:
         if output_dir and transcript_path and transcript_path.exists() and not prompt_path:
             try:
+                stage_started = time.monotonic()
                 prompt_path = write_chatgpt_prompt(
                     transcript_path.read_text(encoding="utf-8"),
                     meta or VideoMeta(title="video", id="video", webpage_url=""),
@@ -788,6 +1129,13 @@ def main() -> int:
                     args.max_chars,
                     prompt_template,
                 )
+                mark_stage(processing, "export_prompt", stage_started)
+            except Exception:
+                pass
+        if output_dir and meta:
+            try:
+                mark_total(processing, run_started)
+                write_meta(meta, output_dir, transcript_source, warnings, processing, options, whisper_context_terms)
             except Exception:
                 pass
         if args.json:
