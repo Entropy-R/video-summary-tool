@@ -22,3 +22,8 @@ If an API key appears in logs, screenshots, Git history, or shared chat:
 ## Responsible use
 
 Only process videos when you have the right to access and summarize the content.
+
+When `--with-vision` is enabled, extracted keyframes are sent only to the configured `VISION_BASE_URL`.
+With the documented defaults, both vision analysis and final summary use local Ollama. If `SUMMARY_PROVIDER=api` or
+`--summary-provider api` is selected, generated visual descriptions and transcript text are sent to `OPENAI_BASE_URL`;
+the original keyframe images are not sent to the summary provider.

@@ -4,9 +4,20 @@ services:
     image: video-summary:local
     working_dir: /app
     environment:
+      SUMMARY_PROVIDER: ${SUMMARY_PROVIDER:-ollama}
+      SUMMARY_API_KEY: ${SUMMARY_API_KEY:-ollama}
+      SUMMARY_BASE_URL: ${SUMMARY_BASE_URL:-http://host.docker.internal:11434/v1}
+      SUMMARY_MODEL: ${SUMMARY_MODEL:-qwen3-vl:8b-instruct-q4_K_M}
+      SUMMARY_TIMEOUT: ${SUMMARY_TIMEOUT:-300}
+      SUMMARY_LOCAL_CHUNK_CHARS: ${SUMMARY_LOCAL_CHUNK_CHARS:-auto}
+      SUMMARY_OLLAMA_CONTEXT_LENGTH: ${SUMMARY_OLLAMA_CONTEXT_LENGTH:-8192}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
+      VISION_API_KEY: ${VISION_API_KEY:-ollama}
+      VISION_BASE_URL: ${VISION_BASE_URL:-http://host.docker.internal:11434/v1}
+      VISION_MODEL: ${VISION_MODEL:-qwen3-vl:8b-instruct-q4_K_M}
+      VISION_TIMEOUT: ${VISION_TIMEOUT:-300}
       VIDEO_SUMMARY_COOKIES: ${VIDEO_SUMMARY_COOKIES:-}
       VIDEO_SUMMARY_COOKIES_FROM_BROWSER: ${VIDEO_SUMMARY_COOKIES_FROM_BROWSER:-}
       XDG_CACHE_HOME: /cache
