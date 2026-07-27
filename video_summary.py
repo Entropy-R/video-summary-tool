@@ -38,6 +38,10 @@ GENERATED_OUTPUT_FILES = (
 )
 CACHE_FILE_NAME = "pipeline_cache.json"
 CACHE_SCHEMA_VERSION = 1
+MIN_VISUAL_CONTEXT_CHARS = 800
+MAX_VISUAL_CONTEXT_CHARS = 3200
+VISUAL_CONTEXT_RATIO = 0.25
+DEFAULT_TRUNCATION_RETRY_TOKENS = 2600
 AVAILABLE_MODEL_SIZES = (
     "tiny",
     "tiny.en",
@@ -239,6 +243,10 @@ class AppError(RuntimeError):
         self.hints = hints or []
 
 
+class LLMOutputTruncatedError(RuntimeError):
+    pass
+
+
 def run_command(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         args,
@@ -324,6 +332,24 @@ def with_cookies(args: list[str], cookies: CookieConfig | None) -> list[str]:
     elif cookies.browser:
         injected.extend(["--cookies-from-browser", cookies.browser])
     return args[:1] + injected + args[1:] if injected else args
+
+
+def cookie_cache_identity(cookies: CookieConfig | None) -> dict | None:
+    if not cookies:
+        return None
+    if cookies.file:
+        path = Path(cookies.file).expanduser().resolve()
+        stat = path.stat()
+        # Cookie 内容属于凭据，只使用文件元数据判断同路径文件是否已更新。
+        return {
+            "type": "file",
+            "path": str(path),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+    if cookies.browser:
+        return {"type": "browser", "browser": cookies.browser}
+    return None
 
 
 def string_list(value) -> list[str]:
@@ -764,10 +790,62 @@ def build_whisper_initial_prompt(terms: list[str]) -> str | None:
     return "视频元数据中出现的关键词包括：" + "、".join(terms)
 
 
+def subtitle_language_from_path(path: Path) -> str | None:
+    return path.stem.rsplit(".", 1)[-1] if "." in path.stem else None
+
+
+def subtitle_language_priority(language: str | None, langs: str) -> int:
+    patterns = [
+        item.strip()
+        for item in langs.split(",")
+        if item.strip() and not item.strip().startswith("-")
+    ]
+    if not language:
+        return len(patterns)
+    for index, pattern in enumerate(patterns):
+        if pattern == "all":
+            return index
+        try:
+            if re.fullmatch(pattern, language):
+                return index
+        except re.error:
+            if pattern == language:
+                return index
+    return len(patterns)
+
+
+def subtitle_type_priority(language: str | None, meta: VideoMeta) -> int:
+    if not language:
+        return 2
+    if language.lower().startswith("ai-"):
+        return 1
+    if language in meta.subtitle_langs:
+        return 0
+    if language in meta.automatic_caption_langs:
+        return 1
+    return 2
+
+
+def select_subtitle_candidate(
+    candidates: Iterable[Path],
+    langs: str,
+    meta: VideoMeta,
+) -> Path | None:
+    ranked = sorted(
+        candidates,
+        key=lambda path: (
+            subtitle_language_priority(subtitle_language_from_path(path), langs),
+            subtitle_type_priority(subtitle_language_from_path(path), meta),
+            path.name,
+        ),
+    )
+    return ranked[0] if ranked else None
+
+
 def detect_subtitle_source(path: Path, meta: VideoMeta) -> tuple[str, list[str]]:
     name = path.name
     warnings: list[str] = []
-    language = path.stem.rsplit(".", 1)[-1] if "." in path.stem else None
+    language = subtitle_language_from_path(path)
     if language:
         meta.selected_subtitle_lang = language
 
@@ -827,36 +905,36 @@ def download_subtitle(
     warnings: list[str] | None = None,
 ) -> tuple[Path, str, list[str]] | None:
     require_tool("yt-dlp")
-    before = set(output_dir.glob("*"))
+    output_prefix = f"subtitle-source-{time.time_ns()}"
     args = with_cookies(
         [
             "yt-dlp",
             "--skip-download",
             "--write-subs",
             "--write-auto-subs",
+            "--force-overwrites",
             "--sub-langs",
             langs,
             "--convert-subs",
             "srt",
             "--no-playlist",
             "-o",
-            "%(title).80s.%(ext)s",
+            f"{output_prefix}.%(ext)s",
             url,
         ],
         cookies,
     )
 
     result = run_command(args, output_dir)
-    after = set(output_dir.glob("*"))
-    candidates = sorted(path for path in after - before if path.suffix.lower() in SUBTITLE_EXTS)
-    if candidates:
-        source, warnings = detect_subtitle_source(candidates[0], meta)
-        return candidates[0], source, warnings
-
-    existing = sorted(path for path in output_dir.glob("*") if path.suffix.lower() in SUBTITLE_EXTS)
-    if existing:
-        source, warnings = detect_subtitle_source(existing[0], meta)
-        return existing[0], source, warnings
+    candidates = [
+        path
+        for path in output_dir.glob(f"{output_prefix}.*")
+        if path.suffix.lower() in SUBTITLE_EXTS
+    ]
+    selected = select_subtitle_candidate(candidates, langs, meta)
+    if selected:
+        source, warnings = detect_subtitle_source(selected, meta)
+        return selected, source, warnings
 
     login_required = "Subtitles are only available when logged in" in result.stderr
     if login_required:
@@ -939,6 +1017,17 @@ def download_video(url: str, output_dir: Path, cookies: CookieConfig | None) -> 
     if candidates:
         return candidates[0]
     raise AppError("video_not_found", "视频下载完成，但没有找到生成的视频文件。")
+
+
+def cleanup_temporary_vision_video(path: Path, warnings: list[str]) -> bool:
+    try:
+        path.unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        warning = f"临时视频清理失败：{exc}"
+        if warning not in warnings:
+            warnings.append(warning)
+        return False
 
 
 def extract_audio_from_video(video_path: Path, output_dir: Path) -> Path:
@@ -1431,11 +1520,13 @@ def write_visual_outputs(
     status: str,
     error: str | None = None,
     metrics: dict | None = None,
+    analysis_signature: str | None = None,
 ) -> tuple[Path, Path]:
     payload = {
         "schema_version": 1,
         "status": status,
         "model": config.model,
+        "analysis_signature": analysis_signature,
         "frame_count": len(frames),
         "frames": frames,
     }
@@ -1495,6 +1586,7 @@ def analyze_keyframes(
     existing_results: list[dict] | None = None,
     transcript: str = "",
     context_terms: list[str] | None = None,
+    analysis_signature: str | None = None,
 ) -> list[dict]:
     current_images = {frame.path.relative_to(output_dir).as_posix() for frame in frames}
     results = [
@@ -1602,24 +1694,50 @@ def analyze_keyframes(
             fallback_count = metrics["fallback_splits"]
             results.extend(request_batch(batch))
             results.sort(key=lambda item: float(item["timestamp_seconds"]))
-            write_visual_outputs(output_dir, config, results, "processing", metrics=metrics)
+            write_visual_outputs(
+                output_dir,
+                config,
+                results,
+                "processing",
+                metrics=metrics,
+                analysis_signature=analysis_signature,
+            )
             if metrics["fallback_splits"] > fallback_count and effective_batch_size > 1:
                 effective_batch_size = max(1, effective_batch_size // 2)
                 metrics["effective_batch_size"] = effective_batch_size
             offset += len(batch)
     except Exception as exc:
-        write_visual_outputs(output_dir, config, results, "failed", str(exc), metrics)
+        write_visual_outputs(
+            output_dir,
+            config,
+            results,
+            "failed",
+            error=str(exc),
+            metrics=metrics,
+            analysis_signature=analysis_signature,
+        )
         raise AppError(
             "vision_analysis_failed",
             f"本地视觉模型解析失败：{exc}",
             ["已保留关键帧和已完成的视觉解析结果，便于调试。"],
         ) from exc
 
-    write_visual_outputs(output_dir, config, results, "completed", metrics=metrics)
+    write_visual_outputs(
+        output_dir,
+        config,
+        results,
+        "completed",
+        metrics=metrics,
+        analysis_signature=analysis_signature,
+    )
     return results
 
 
-def load_visual_results(output_dir: Path, model: str) -> list[dict]:
+def load_visual_results(
+    output_dir: Path,
+    model: str,
+    analysis_signature: str,
+) -> list[dict]:
     path = output_dir / "visual_context.json"
     if not path.is_file():
         return []
@@ -1627,7 +1745,11 @@ def load_visual_results(output_dir: Path, model: str) -> list[dict]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
-    if payload.get("model") != model or not isinstance(payload.get("frames"), list):
+    if (
+        payload.get("model") != model
+        or payload.get("analysis_signature") != analysis_signature
+        or not isinstance(payload.get("frames"), list)
+    ):
         return []
     return [item for item in payload["frames"] if isinstance(item, dict)]
 
@@ -1789,14 +1911,25 @@ def limit_visual_events(
             indexes_set.add(next_index)
         indexes = sorted(indexes_set)
     selected = [visual_events[index] for index in indexes]
-    per_event_budget = max(40, char_budget // max(len(selected), 1) - 1)
-    limited = [
-        (seconds, priority, text if len(text) <= per_event_budget else text[:per_event_budget].rstrip() + "……")
-        for seconds, priority, text in selected
-    ]
+    per_event_budget = max(1, char_budget // max(len(selected), 1) - 1)
+    limited = []
+    for seconds, priority, text in selected:
+        if len(text) > per_event_budget:
+            suffix = "……" if per_event_budget > 2 else ""
+            text = text[: max(1, per_event_budget - len(suffix))].rstrip() + suffix
+        limited.append((seconds, priority, text))
     while limited and sum(len(text) + 1 for _seconds, _priority, text in limited) > char_budget:
         limited.pop()
     return limited
+
+
+def determine_visual_char_budget(max_chars: int, transcript_context_chars: int) -> int:
+    independent_budget = max(
+        MIN_VISUAL_CONTEXT_CHARS,
+        math.ceil(max_chars * VISUAL_CONTEXT_RATIO),
+    )
+    available_budget = max(0, max_chars - transcript_context_chars)
+    return min(MAX_VISUAL_CONTEXT_CHARS, max(independent_budget, available_budget))
 
 
 def build_multimodal_context(
@@ -1834,7 +1967,10 @@ def build_multimodal_context(
 
     if max_chars:
         base_chars = len("\n".join([*header, *(text for _seconds, _priority, text in transcript_events)])) + 1
-        visual_events = limit_visual_events(visual_events, max(0, max_chars - base_chars))
+        visual_events = limit_visual_events(
+            visual_events,
+            determine_visual_char_budget(max_chars, base_chars),
+        )
 
     lines = [
         *header,
@@ -2097,31 +2233,67 @@ def is_context_length_error(exc: Exception) -> bool:
     )
 
 
-def call_summary_llm(client, config: SummaryConfig, model: str, prompt: str, max_tokens: int | None) -> str:
-    if config.provider != "ollama":
-        return call_llm(client, model, prompt, max_tokens)
-    options = {"temperature": 0.2}
-    if config.context_length:
-        options["num_ctx"] = config.context_length
-    if max_tokens is not None:
-        options["num_predict"] = max_tokens
-    response = ollama_request(
-        config,
-        "/api/chat",
-        {
-            "model": model,
-            "messages": [
+def validate_llm_output(content, finish_reason, provider: str) -> str:
+    reason = str(finish_reason or "").strip().lower()
+    if reason in {"length", "max_tokens"}:
+        raise LLMOutputTruncatedError(f"{provider} 总结输出因长度限制被截断。")
+    if reason and reason != "stop":
+        raise RuntimeError(f"{provider} 总结输出异常结束：{reason}。")
+    text = str(content or "")
+    if not text.strip():
+        raise RuntimeError(f"{provider} 总结模型返回了空内容。")
+    return text
+
+
+def expanded_output_token_budget(max_tokens: int | None) -> int:
+    if max_tokens is None:
+        return DEFAULT_TRUNCATION_RETRY_TOKENS
+    return max_tokens * 2
+
+
+def call_summary_llm(
+    client,
+    config: SummaryConfig,
+    model: str,
+    prompt: str,
+    max_tokens: int | None,
+) -> str:
+    current_max_tokens = max_tokens
+    for attempt in range(2):
+        try:
+            if config.provider != "ollama":
+                return call_llm(client, model, prompt, current_max_tokens)
+            options = {"temperature": 0.2}
+            if config.context_length:
+                options["num_ctx"] = config.context_length
+            if current_max_tokens is not None:
+                options["num_predict"] = current_max_tokens
+            response = ollama_request(
+                config,
+                "/api/chat",
                 {
-                    "role": "system",
-                    "content": "你是严谨的视频内容总结助手，只基于给定文本总结，并使用中文输出。",
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是严谨的视频内容总结助手，只基于给定文本总结，并使用中文输出。",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "stream": False,
+                    "options": options,
                 },
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "options": options,
-        },
-    )
-    return str((response.get("message") or {}).get("content") or "")
+            )
+            return validate_llm_output(
+                (response.get("message") or {}).get("content"),
+                response.get("done_reason"),
+                "Ollama",
+            )
+        except LLMOutputTruncatedError:
+            if attempt:
+                raise
+            current_max_tokens = expanded_output_token_budget(current_max_tokens)
+    raise RuntimeError("总结模型调用失败。")
 
 
 def classify_llm_error(exc: Exception) -> AppError:
@@ -2193,7 +2365,12 @@ def call_llm(client, model: str, prompt: str, max_tokens: int | None = None) -> 
     response = client.chat.completions.create(
         **request,
     )
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    return validate_llm_output(
+        choice.message.content,
+        getattr(choice, "finish_reason", None),
+        "OpenAI",
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -2348,7 +2525,7 @@ def main() -> int:
                 "language": whisper_language,
                 "sub_langs": args.sub_langs,
                 "force_transcribe": args.force_transcribe,
-                "cookies": bool(cookies and (cookies.file or cookies.browser)),
+                "cookies": cookie_cache_identity(cookies),
             }
         )
         write_meta(meta, output_dir, None, warnings, processing, options)
@@ -2546,14 +2723,17 @@ def main() -> int:
             processing["vision"]["status"] = "analyzing"
 
             if downloaded_vision_video:
-                try:
-                    vision_video_path.unlink(missing_ok=True)
-                    downloaded_vision_video = False
-                except OSError as exc:
-                    warnings.append(f"临时视频清理失败：{exc}")
+                downloaded_vision_video = not cleanup_temporary_vision_video(
+                    vision_video_path,
+                    warnings,
+                )
 
             visual_context_path = output_dir / "visual_context.json"
-            existing_visual_results = load_visual_results(output_dir, vision_config.model)
+            existing_visual_results = load_visual_results(
+                output_dir,
+                vision_config.model,
+                vision_cache_signature,
+            )
             visual_cache_complete = bool(
                 args.resume
                 and vision_cache_signature
@@ -2574,6 +2754,7 @@ def main() -> int:
                     existing_results=existing_visual_results if args.resume else None,
                     transcript=transcript,
                     context_terms=build_whisper_context_terms(meta),
+                    analysis_signature=vision_cache_signature,
                 )
                 mark_stage(processing, "analyze_keyframes", stage_started)
                 if vision_cache_signature:
@@ -2590,6 +2771,10 @@ def main() -> int:
                 determine_summary_chunk_chars(summary_config, args.max_chars)
                 if summary_config
                 else args.max_chars
+            )
+            visual_char_budget = determine_visual_char_budget(
+                visual_summary_limit,
+                len(build_multimodal_context(transcript, [])),
             )
             summary_input = build_multimodal_context(
                 transcript,
@@ -2608,7 +2793,7 @@ def main() -> int:
                     "frame_sources": dict(Counter(frame.source for frame in keyframes)),
                     "context_frames": summary_input.count("] 画面："),
                     "compacted_frames": len(compact_visual_material(visual_frames, transcript)),
-                    "visual_char_budget": max(0, visual_summary_limit - len(transcript)),
+                    "visual_char_budget": visual_char_budget,
                     "multimodal_chars": len(summary_input),
                     "analysis_metrics": load_visual_metrics(output_dir),
                     "visual_context": str(visual_context_path),
@@ -2668,7 +2853,7 @@ def main() -> int:
                 "max_chars": args.max_chars,
                 "provider_chunk_chars": summary_config.chunk_chars,
                 "context_length": summary_config.context_length,
-                "summary_schema": 10,
+                "summary_schema": 11,
                 "prompt": hashlib.sha256(summary_prompt_template.encode("utf-8")).hexdigest(),
             }
         )
@@ -2874,6 +3059,22 @@ def main() -> int:
             if prompt_path:
                 print(f"提示：已自动生成 ChatGPT 提示词，可复制到 ChatGPT：{prompt_path}", file=sys.stderr)
         return 1
+    finally:
+        if downloaded_vision_video and vision_video_path:
+            cleaned = cleanup_temporary_vision_video(vision_video_path, warnings)
+            if not cleaned and output_dir and meta:
+                try:
+                    write_meta(
+                        meta,
+                        output_dir,
+                        transcript_source,
+                        warnings,
+                        processing,
+                        options,
+                        whisper_context_terms,
+                    )
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
