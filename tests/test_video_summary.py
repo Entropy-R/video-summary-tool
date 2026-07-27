@@ -67,6 +67,18 @@ class ArgumentTests(unittest.TestCase):
             with self.subTest(flag=flag), self.assertRaises(video_summary.AppError):
                 video_summary.validate_args(video_summary.parse_args(argv))
 
+    def test_max_chars_must_be_positive(self):
+        for value in ("0", "-1"):
+            args = video_summary.parse_args(
+                ["https://example.com/video", "--max-chars", value]
+            )
+            with self.subTest(value=value), self.assertRaises(
+                video_summary.AppError
+            ) as context:
+                video_summary.validate_args(args)
+
+            self.assertIn("--max-chars", context.exception.message)
+
     def test_summary_provider_defaults_to_local_ollama(self):
         with patch.dict(os.environ, {}, clear=True):
             config = video_summary.resolve_summary_config("ollama")
@@ -390,6 +402,59 @@ class SummaryResponseTests(unittest.TestCase):
                 empty_client,
                 config,
                 config.model,
+                "prompt",
+                100,
+            )
+
+    def test_missing_completion_reason_fails_for_both_providers(self):
+        ollama_config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            model="qwen",
+            timeout=30,
+        )
+        with patch.object(
+            video_summary,
+            "ollama_request",
+            return_value={"message": {"content": "未确认完成的结果"}},
+        ) as request, self.assertRaisesRegex(RuntimeError, "缺少结束原因"):
+            video_summary.call_summary_llm(
+                None,
+                ollama_config,
+                ollama_config.model,
+                "prompt",
+                100,
+            )
+        self.assertEqual(request.call_count, 1)
+
+        api_config = video_summary.SummaryConfig(
+            provider="api",
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="model",
+            timeout=30,
+        )
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(
+                    create=lambda **_kwargs: types.SimpleNamespace(
+                        choices=[
+                            types.SimpleNamespace(
+                                message=types.SimpleNamespace(
+                                    content="未确认完成的结果"
+                                )
+                            )
+                        ]
+                    )
+                )
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "缺少结束原因"):
+            video_summary.call_summary_llm(
+                client,
+                api_config,
+                api_config.model,
                 "prompt",
                 100,
             )
@@ -964,6 +1029,65 @@ class VisionOutputTests(unittest.TestCase):
 
 
 class TemporaryVideoCleanupTests(unittest.TestCase):
+    def test_download_failure_removes_only_current_prefix_artifacts(self):
+        result = subprocess.CompletedProcess(
+            args=["yt-dlp"],
+            returncode=1,
+            stdout="",
+            stderr="download failed",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            current_part = output_dir / "vision-source-123.mp4.part"
+            current_fragment = output_dir / "vision-source-123.f137.mp4"
+            unrelated = output_dir / "vision-source-older.mp4"
+            current_part.write_bytes(b"partial")
+            current_fragment.write_bytes(b"fragment")
+            unrelated.write_bytes(b"keep")
+
+            with patch.object(video_summary, "require_tool"), patch.object(
+                video_summary.time, "time_ns", return_value=123
+            ), patch.object(
+                video_summary, "run_command", return_value=result
+            ), self.assertRaises(video_summary.AppError):
+                video_summary.download_video(
+                    "https://example.com/video",
+                    output_dir,
+                    None,
+                )
+
+            self.assertFalse(current_part.exists())
+            self.assertFalse(current_fragment.exists())
+            self.assertTrue(unrelated.exists())
+
+    def test_missing_download_candidate_removes_partial_artifacts(self):
+        result = subprocess.CompletedProcess(
+            args=["yt-dlp"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            partial = output_dir / "vision-source-456.mp4.part"
+            partial.write_bytes(b"partial")
+
+            with patch.object(video_summary, "require_tool"), patch.object(
+                video_summary.time, "time_ns", return_value=456
+            ), patch.object(
+                video_summary, "run_command", return_value=result
+            ), self.assertRaises(video_summary.AppError) as context:
+                video_summary.download_video(
+                    "https://example.com/video",
+                    output_dir,
+                    None,
+                )
+
+            self.assertEqual(context.exception.code, "video_not_found")
+            self.assertFalse(partial.exists())
+
     def test_early_failure_removes_video_downloaded_for_current_run(self):
         with tempfile.TemporaryDirectory() as temp_name:
             args = video_summary.parse_args(

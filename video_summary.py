@@ -572,6 +572,7 @@ def validate_args(args: argparse.Namespace) -> None:
             "--with-vision 暂不能与 --no-llm、--export-prompt 或 --summary-from-file 同时使用。",
         )
     positive_values = {
+        "--max-chars": args.max_chars,
         "--vision-scan-interval": args.vision_scan_interval,
         "--vision-max-gap": args.vision_max_gap,
         "--vision-max-frames": args.vision_max_frames,
@@ -1009,14 +1010,28 @@ def download_video(url: str, output_dir: Path, cookies: CookieConfig | None) -> 
     )
     result = run_command(args, output_dir)
     if result.returncode != 0:
-        raise classify_command_error(result.stderr, url, "视频下载")
+        error = classify_command_error(result.stderr, url, "视频下载")
+        cleanup_video_download_artifacts(output_dir, output_prefix)
+        raise error
 
     candidates = sorted(
         path for path in output_dir.glob(f"{output_prefix}.*") if path.suffix.lower() in VIDEO_EXTS
     )
     if candidates:
         return candidates[0]
+    cleanup_video_download_artifacts(output_dir, output_prefix)
     raise AppError("video_not_found", "视频下载完成，但没有找到生成的视频文件。")
+
+
+def cleanup_video_download_artifacts(output_dir: Path, output_prefix: str) -> None:
+    for path in output_dir.glob(f"{output_prefix}.*"):
+        if not (path.is_file() or path.is_symlink()):
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            # 清理失败不能覆盖 yt-dlp 的原始下载错误。
+            print(f"警告：临时视频清理失败：{exc}", file=sys.stderr)
 
 
 def cleanup_temporary_vision_video(path: Path, warnings: list[str]) -> bool:
@@ -2237,7 +2252,9 @@ def validate_llm_output(content, finish_reason, provider: str) -> str:
     reason = str(finish_reason or "").strip().lower()
     if reason in {"length", "max_tokens"}:
         raise LLMOutputTruncatedError(f"{provider} 总结输出因长度限制被截断。")
-    if reason and reason != "stop":
+    if not reason:
+        raise RuntimeError(f"{provider} 总结输出缺少结束原因。")
+    if reason != "stop":
         raise RuntimeError(f"{provider} 总结输出异常结束：{reason}。")
     text = str(content or "")
     if not text.strip():
@@ -2853,7 +2870,7 @@ def main() -> int:
                 "max_chars": args.max_chars,
                 "provider_chunk_chars": summary_config.chunk_chars,
                 "context_length": summary_config.context_length,
-                "summary_schema": 11,
+                "summary_schema": 12,
                 "prompt": hashlib.sha256(summary_prompt_template.encode("utf-8")).hexdigest(),
             }
         )
