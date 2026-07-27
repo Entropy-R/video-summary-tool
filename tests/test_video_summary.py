@@ -150,6 +150,95 @@ class SubtitleTests(unittest.TestCase):
             ["使用的是平台自动字幕（ai-zh），内容可能存在识别错误。"],
         )
 
+    def test_download_prefers_requested_manual_subtitle_from_current_run(self):
+        meta = video_summary.VideoMeta(
+            "video",
+            "BV1",
+            "https://www.bilibili.com/video/BV1",
+            subtitle_langs=["zh"],
+            automatic_caption_langs=["ai-zh"],
+        )
+        captured_args = []
+
+        def create_subtitles(args, cwd):
+            captured_args.extend(args)
+            (cwd / "subtitle-source-123.ai-zh.srt").write_text("自动字幕", encoding="utf-8")
+            (cwd / "subtitle-source-123.zh.srt").write_text("人工字幕", encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            video_summary, "require_tool"
+        ), patch.object(video_summary.time, "time_ns", return_value=123), patch.object(
+            video_summary, "run_command", side_effect=create_subtitles
+        ):
+            selected = video_summary.download_subtitle(
+                meta.webpage_url,
+                Path(temp_name),
+                None,
+                "zh,ai-zh",
+                meta,
+            )
+
+        self.assertEqual(selected[0].name, "subtitle-source-123.zh.srt")
+        self.assertEqual(selected[1], "manual_subtitle")
+        self.assertIn("--force-overwrites", captured_args)
+
+    def test_download_does_not_reuse_subtitle_from_previous_run(self):
+        meta = video_summary.VideoMeta("video", "BV1", "https://www.bilibili.com/video/BV1")
+        result = subprocess.CompletedProcess(
+            args=["yt-dlp"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            (output_dir / "old-video.zh.srt").write_text("旧字幕", encoding="utf-8")
+            with patch.object(video_summary, "require_tool"), patch.object(
+                video_summary.time, "time_ns", return_value=456
+            ), patch.object(video_summary, "run_command", return_value=result):
+                selected = video_summary.download_subtitle(
+                    meta.webpage_url,
+                    output_dir,
+                    None,
+                    "zh.*",
+                    meta,
+                )
+
+        self.assertIsNone(selected)
+
+
+class CacheSignatureTests(unittest.TestCase):
+    def test_cookie_file_update_changes_cache_identity_without_reading_content(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            cookie_path = Path(temp_name) / "cookies.txt"
+            cookie_path.write_text("first", encoding="utf-8")
+            first = video_summary.cookie_cache_identity(
+                video_summary.CookieConfig(file=str(cookie_path))
+            )
+            first_mtime = cookie_path.stat().st_mtime_ns
+            cookie_path.write_text("other", encoding="utf-8")
+            os.utime(cookie_path, ns=(first_mtime + 1_000_000, first_mtime + 1_000_000))
+            second = video_summary.cookie_cache_identity(
+                video_summary.CookieConfig(file=str(cookie_path))
+            )
+
+        self.assertEqual(first["path"], str(cookie_path.resolve()))
+        self.assertEqual(first["size"], second["size"])
+        self.assertNotEqual(first["mtime_ns"], second["mtime_ns"])
+        self.assertNotEqual(
+            video_summary.stable_signature(first),
+            video_summary.stable_signature(second),
+        )
+        self.assertEqual(set(first), {"type", "path", "size", "mtime_ns"})
+        self.assertEqual(
+            video_summary.cookie_cache_identity(
+                video_summary.CookieConfig(browser="chrome")
+            ),
+            {"type": "browser", "browser": "chrome"},
+        )
+
 
 class SummaryChunkTests(unittest.TestCase):
     def test_ollama_context_determines_default_chunk_size(self):
@@ -188,6 +277,122 @@ class SummaryChunkTests(unittest.TestCase):
         self.assertIn("第 2/2 段摘要", material)
         self.assertIn("开头、中间和结尾", material)
         self.assertIn("不得声称“原文截断”", material)
+
+
+class SummaryResponseTests(unittest.TestCase):
+    def test_ollama_length_truncation_retries_once_with_larger_budget(self):
+        config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            model="qwen",
+            timeout=30,
+            context_length=8192,
+        )
+        responses = [
+            {"done_reason": "length", "message": {"content": "部分结果"}},
+            {"done_reason": "stop", "message": {"content": "完整结果"}},
+        ]
+
+        with patch.object(
+            video_summary,
+            "ollama_request",
+            side_effect=responses,
+        ) as request:
+            text = video_summary.call_summary_llm(
+                None,
+                config,
+                config.model,
+                "prompt",
+                100,
+            )
+
+        self.assertEqual(text, "完整结果")
+        self.assertEqual(
+            [call.args[2]["options"]["num_predict"] for call in request.call_args_list],
+            [100, 200],
+        )
+
+    def test_repeated_ollama_truncation_fails(self):
+        config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            model="qwen",
+            timeout=30,
+        )
+        response = {"done_reason": "length", "message": {"content": "部分结果"}}
+
+        with patch.object(
+            video_summary,
+            "ollama_request",
+            side_effect=[response, response],
+        ), self.assertRaises(video_summary.LLMOutputTruncatedError):
+            video_summary.call_summary_llm(None, config, config.model, "prompt", 100)
+
+    def test_openai_length_truncation_retries_and_empty_output_fails(self):
+        requests = []
+        responses = [
+            types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        finish_reason="length",
+                        message=types.SimpleNamespace(content="部分结果"),
+                    )
+                ]
+            ),
+            types.SimpleNamespace(
+                choices=[
+                    types.SimpleNamespace(
+                        finish_reason="stop",
+                        message=types.SimpleNamespace(content="完整结果"),
+                    )
+                ]
+            ),
+        ]
+
+        def create(**kwargs):
+            requests.append(kwargs)
+            return responses.pop(0)
+
+        client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(completions=types.SimpleNamespace(create=create))
+        )
+        config = video_summary.SummaryConfig(
+            provider="api",
+            api_key="key",
+            base_url="https://api.openai.com/v1",
+            model="model",
+            timeout=30,
+        )
+
+        text = video_summary.call_summary_llm(client, config, config.model, "prompt", 100)
+
+        self.assertEqual(text, "完整结果")
+        self.assertEqual([request["max_tokens"] for request in requests], [100, 200])
+
+        empty_client = types.SimpleNamespace(
+            chat=types.SimpleNamespace(
+                completions=types.SimpleNamespace(
+                    create=lambda **_kwargs: types.SimpleNamespace(
+                        choices=[
+                            types.SimpleNamespace(
+                                finish_reason="stop",
+                                message=types.SimpleNamespace(content="  "),
+                            )
+                        ]
+                    )
+                )
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "空内容"):
+            video_summary.call_summary_llm(
+                empty_client,
+                config,
+                config.model,
+                "prompt",
+                100,
+            )
 
 
 class FrameSelectionTests(unittest.TestCase):
@@ -434,10 +639,43 @@ class VisionOutputTests(unittest.TestCase):
             visuals,
             max_chars=len(transcript) + 500,
         )
+        base_context = video_summary.build_multimodal_context(transcript, [])
+        visual_budget = video_summary.determine_visual_char_budget(
+            len(transcript) + 500,
+            len(base_context),
+        )
 
         self.assertIn("第 29 条字幕内容", context)
-        self.assertLessEqual(len(context), len(transcript) + 500)
+        self.assertLessEqual(len(context), len(base_context) + visual_budget)
         self.assertLess(context.count("] 画面："), len(visuals))
+
+    def test_long_transcript_keeps_visual_budget_and_splits_later(self):
+        transcript = "\n".join(
+            f"[00:00:{index:02d}] 第 {index} 条字幕" + "完整内容" * 30
+            for index in range(20)
+        )
+        visuals = [
+            {
+                "timestamp_seconds": 10,
+                "timestamp": "00:00:10",
+                "description": "展示字幕中没有提到的系统架构图" + "节点关系" * 100,
+                "visible_text": "入口服务 → 任务队列 → 分析服务",
+                "importance": "high",
+                "uncertainty": "",
+            }
+        ]
+
+        context = video_summary.build_multimodal_context(
+            transcript,
+            visuals,
+            max_chars=600,
+        )
+        chunks = video_summary.split_text_balanced(context, 600)
+
+        self.assertIn("第 19 条字幕", context)
+        self.assertIn("] 画面：", context)
+        self.assertGreater(len(context), 600)
+        self.assertGreater(len(chunks), 1)
 
     def test_multimodal_budget_keeps_exact_command_evidence(self):
         visuals = [
@@ -488,11 +726,61 @@ class VisionOutputTests(unittest.TestCase):
             frame_path.write_bytes(b"image")
             frames = [video_summary.FrameCandidate(frame_path, 0, "periodic")]
 
-            results = video_summary.analyze_keyframes(client, config, frames, output_dir, 1)
+            results = video_summary.analyze_keyframes(
+                client,
+                config,
+                frames,
+                output_dir,
+                1,
+                analysis_signature="analysis-signature",
+            )
             artifact = video_summary.parse_json_object((output_dir / "visual_context.json").read_text())
 
         self.assertEqual(results[0]["description"], "首页")
         self.assertEqual(artifact["status"], "completed")
+        self.assertEqual(artifact["analysis_signature"], "analysis-signature")
+
+    def test_visual_resume_requires_matching_analysis_signature(self):
+        config = video_summary.VisionConfig("ollama", "http://localhost/v1", "qwen", 30)
+        frames = [
+            {
+                "timestamp_seconds": 0,
+                "timestamp": "00:00:00",
+                "image": "frame.jpg",
+                "frame_source": "periodic",
+                "description": "旧画面结果",
+                "visible_text": "",
+                "importance": "medium",
+                "uncertainty": "",
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            video_summary.write_visual_outputs(
+                output_dir,
+                config,
+                frames,
+                "processing",
+                analysis_signature="old-signature",
+            )
+            matching = video_summary.load_visual_results(
+                output_dir,
+                config.model,
+                "old-signature",
+            )
+            stale = video_summary.load_visual_results(
+                output_dir,
+                config.model,
+                "new-signature",
+            )
+            artifact = json.loads(
+                (output_dir / "visual_context.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(matching, frames)
+        self.assertEqual(stale, [])
+        self.assertEqual(artifact["analysis_signature"], "old-signature")
 
     def test_visual_failure_is_strict_and_keeps_failed_artifact(self):
         def fail(**_kwargs):
@@ -673,6 +961,75 @@ class VisionOutputTests(unittest.TestCase):
         self.assertEqual(len(results), 6)
         self.assertEqual(calls, [4, 4, 2, 2, 2])
         self.assertEqual(artifact["metrics"]["effective_batch_size"], 2)
+
+
+class TemporaryVideoCleanupTests(unittest.TestCase):
+    def test_early_failure_removes_video_downloaded_for_current_run(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            args = video_summary.parse_args(
+                [
+                    "https://example.com/video",
+                    "--with-vision",
+                    "--output",
+                    temp_name,
+                ]
+            )
+            summary_config = video_summary.SummaryConfig(
+                provider="api",
+                api_key="key",
+                base_url="https://api.openai.com/v1",
+                model="summary-model",
+                timeout=30,
+            )
+            vision_config = video_summary.VisionConfig(
+                "key",
+                "https://api.openai.com/v1",
+                "vision-model",
+                30,
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "id",
+                "https://example.com/video",
+                duration=60,
+            )
+            downloaded = {}
+
+            def create_downloaded_video(_url, output_dir, _cookies):
+                path = output_dir / "vision-source-current.mp4"
+                path.write_bytes(b"video")
+                downloaded["path"] = path
+                return path
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary, "parse_args", return_value=args
+            ), patch.object(
+                video_summary, "resolve_summary_config", return_value=summary_config
+            ), patch.object(
+                video_summary, "create_summary_client", return_value=object()
+            ), patch.object(
+                video_summary, "resolve_cookie_config", return_value=video_summary.CookieConfig()
+            ), patch.object(
+                video_summary, "require_tool"
+            ), patch.object(
+                video_summary, "load_meta", return_value=meta
+            ), patch.object(
+                video_summary, "resolve_vision_config", return_value=vision_config
+            ), patch.object(
+                video_summary, "create_vision_client", return_value=object()
+            ), patch.object(
+                video_summary, "download_video", side_effect=create_downloaded_video
+            ), patch.object(
+                video_summary, "download_subtitle", return_value=None
+            ), patch.object(
+                video_summary,
+                "extract_audio_from_video",
+                side_effect=video_summary.AppError("audio_failed", "音频抽取失败"),
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse(downloaded["path"].exists())
 
 
 if __name__ == "__main__":
