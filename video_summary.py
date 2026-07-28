@@ -42,6 +42,7 @@ MIN_VISUAL_CONTEXT_CHARS = 800
 MAX_VISUAL_CONTEXT_CHARS = 3200
 VISUAL_CONTEXT_RATIO = 0.25
 DEFAULT_TRUNCATION_RETRY_TOKENS = 2600
+OLLAMA_PARTIAL_SUMMARY_TOKENS = 1000
 AVAILABLE_MODEL_SIZES = (
     "tiny",
     "tiny.en",
@@ -2198,8 +2199,9 @@ def summarize_with_llm(
     effective_max_chars = determine_summary_chunk_chars(config, max_chars)
     single_max_tokens = 1300 if config.provider == "ollama" else None
     final_max_tokens = 1300 if config.provider == "ollama" else None
-    # 自动放大分段后需要同步提高中间摘要预算，否则长分段后半部分容易被截断。
-    partial_max_tokens = 350 if config.provider == "ollama" else None
+    # 分段模板要求覆盖 6–10 个时间节点及重要细节；预算过低会让真实长视频在完成前被截断。
+    # 首次请求保留常见完整输出空间，仍按统一规则只放大重试一次，避免把残缺结果写入缓存。
+    partial_max_tokens = OLLAMA_PARTIAL_SUMMARY_TOKENS if config.provider == "ollama" else None
     fallback_used = False
 
     while True:

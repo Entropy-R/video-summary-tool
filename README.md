@@ -10,10 +10,14 @@
 4. 默认调用宿主机 Ollama 中的 Qwen3-VL 生成中文总结；也可显式切换到 OpenAI 兼容 API。
 5. 如果没有 API 额度，也可以导出 `chatgpt_prompt.md`，复制到 ChatGPT 手动总结。
 
+新增的图片/画面阅读能力适合 PPT、代码、图表、软件界面和操作步骤较多的视频。它不是逐帧识别，
+而是按视频时长自适应筛选关键帧，将画面证据与完整语音/字幕按时间轴合并后再生成总结。
+
 适合这些场景：
 
 - 总结 B 站视频、YouTube 视频或其他 `yt-dlp` 支持的视频链接。
 - 总结本地音视频文件。
+- 阅读课程、录屏和产品演示中的 PPT、代码、图表、界面与关键操作画面。
 - 只生成转写稿，不调用大模型。
 - 把长视频转写成 prompt，手动发给 ChatGPT。
 
@@ -72,6 +76,18 @@ ollama pull qwen3-vl:8b-instruct-q4_K_M
 
 `.env.example` 已将最终总结配置为本地 Ollama。默认流程仍不下载或解析视频画面；只有显式使用
 `--with-vision` 时才会启用关键帧分析。
+
+默认文字模式：
+
+```powershell
+docker compose run --rm video-summary "视频链接或本地视频路径"
+```
+
+启用图片/画面阅读：
+
+```powershell
+docker compose run --rm video-summary "视频链接或本地视频路径" --with-vision
+```
 
 ## 常用场景
 
@@ -152,7 +168,7 @@ docker compose run --rm video-summary --summary-from-file /app/outputs/example/t
 
 适合已经有 `transcript.txt`，不想重新下载或转写的情况。
 
-### 6. 使用本地 Qwen3-VL 进行多模态解析
+### 6. 启用图片/画面阅读（多模态解析）
 
 当前方案要求 macOS 14 或更高版本。在 macOS 宿主机安装并启动 Ollama，然后拉取模型：
 
@@ -175,6 +191,13 @@ VISION_TIMEOUT=300
 docker compose run --rm video-summary "视频链接或本地视频路径" --with-vision
 ```
 
+图片/画面阅读会执行以下步骤：
+
+1. 下载视频或读取本地文件，并完整保留字幕/Whisper 转写。
+2. 按视频时长扫描候选画面，结合镜头变化与相似度去重筛选关键帧。
+3. 使用本地 Qwen3-VL 读取画面描述和屏幕文字，并结合相邻语音校正 OCR。
+4. 将语音/字幕与画面证据按时间轴合并，最后生成包含“关键画面信息”的中文总结。
+
 多模态模式会根据视频时长自动计算候选帧密度和实际帧预算，并补充镜头变化帧。短视频保留基础覆盖，
 长视频约按每 30 秒增长一帧，最终受 `--vision-max-frames` 硬上限约束。画面差异去重会忽略边缘
 页眉、水印和播放器装饰；关键帧默认缩放到 768 像素宽，视觉模型每批分析 4 帧，并结合相邻字幕
@@ -184,6 +207,17 @@ docker compose run --rm video-summary "视频链接或本地视频路径" --with
 如果当前 Ollama 上下文无法一次处理默认批量，程序会自动拆成更小批次，并在后续请求中记住已经
 验证可用的批量。最终多模态材料会完整保留字幕，并根据总结模型的安全上下文限制视觉补充预算；
 短中视频会尽量使用单次总结，长视频仍采用均衡分段。
+
+成功后可重点查看：
+
+- `summary.md`：综合语音与画面生成的最终总结。
+- `visual_context.md`：按时间列出的关键画面描述，便于人工核对。
+- `multimodal_context.txt`：完整语音/字幕与画面证据合并后的时间轴材料。
+- `frames/run-*/`：筛选出的关键帧，仅用于调试和复核。
+
+图片仅发送给配置的视觉模型。默认配置使用宿主机 Ollama，本地处理图片；最终文本总结只接收已经
+生成的文字材料。首次运行需要下载 Whisper 模型，并可能花费较长时间，16 GB 内存机器建议保持
+单任务运行。
 
 为保证旧参数语义不变，`--with-vision` 暂不能与 `--no-llm`、`--export-prompt`、`--summary-from-file` 同时使用。
 

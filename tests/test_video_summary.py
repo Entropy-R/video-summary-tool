@@ -290,6 +290,49 @@ class SummaryChunkTests(unittest.TestCase):
         self.assertIn("开头、中间和结尾", material)
         self.assertIn("不得声称“原文截断”", material)
 
+    def test_ollama_chunk_summaries_have_sufficient_output_budget(self):
+        config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://localhost:11434/v1",
+            model="qwen3-vl:8b",
+            timeout=300,
+            context_length=8192,
+        )
+        meta = video_summary.VideoMeta("video", "video", "https://example.com/video")
+
+        with patch.object(
+            video_summary,
+            "call_summary_llm",
+            return_value="完整摘要",
+        ) as call:
+            result = video_summary.summarize_with_llm(
+                None,
+                config,
+                "a" * 7000,
+                meta,
+                "whisper",
+                12000,
+                video_summary.DEFAULT_PROMPT_TEMPLATE,
+            )
+
+        self.assertEqual(result.chunks, 2)
+        self.assertEqual(
+            [item.args[4] for item in call.call_args_list],
+            [
+                video_summary.OLLAMA_PARTIAL_SUMMARY_TOKENS,
+                video_summary.OLLAMA_PARTIAL_SUMMARY_TOKENS,
+                1300,
+            ],
+        )
+        self.assertEqual(video_summary.OLLAMA_PARTIAL_SUMMARY_TOKENS, 1000)
+        self.assertEqual(
+            video_summary.expanded_output_token_budget(
+                video_summary.OLLAMA_PARTIAL_SUMMARY_TOKENS
+            ),
+            2000,
+        )
+
 
 class SummaryResponseTests(unittest.TestCase):
     def test_ollama_length_truncation_retries_once_with_larger_budget(self):
