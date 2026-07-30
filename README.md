@@ -89,6 +89,31 @@ docker compose run --rm video-summary "视频链接或本地视频路径"
 docker compose run --rm video-summary "视频链接或本地视频路径" --with-vision
 ```
 
+### 运行环境自检
+
+切换开发机器、修改模型配置或排查运行环境时，可以先执行自检。自检不会处理视频，也不会生成
+转写稿、总结或其他视频产物：
+
+```powershell
+docker compose run --rm video-summary --doctor
+```
+
+同时检查视觉模型：
+
+```powershell
+docker compose run --rm video-summary --doctor --with-vision
+```
+
+自检会检查 Python 依赖、`yt-dlp`、FFmpeg、FFprobe、输出目录写入权限、模型配置、服务连通性和
+目标模型。检查结果分为 `PASS`、`WARN`、`FAIL`；存在 `FAIL` 时退出码为 1，否则为 0。云端
+OpenAI 兼容 API 如果不支持模型列表接口，会显示 `WARN`，不会误判为服务不可用。
+
+需要交给脚本或 CI 读取时追加 `--json`：
+
+```powershell
+docker compose run --rm video-summary --doctor --with-vision --json
+```
+
 ## 常用场景
 
 ### 1. 总结本地视频
@@ -359,6 +384,7 @@ outputs/
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `--doctor` | `false` | 检查依赖、输出权限、模型配置和服务连通性，不处理视频。 |
 | `--output` | `outputs` | 输出目录。 |
 | `--model-size` | `small` | Whisper 模型大小，影响转写速度和准确率。 |
 | `--language` | `zh` | Whisper 识别语言。中文视频默认不用配置；英文视频建议传 `en`；中英文不确定或多语言内容可传 `auto`。 |

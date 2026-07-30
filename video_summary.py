@@ -4,6 +4,7 @@ import argparse
 import base64
 import difflib
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -236,6 +237,13 @@ class SummaryResult:
     fallback_used: bool = False
 
 
+@dataclass
+class DoctorCheck:
+    id: str
+    status: str
+    message: str
+
+
 class AppError(RuntimeError):
     def __init__(self, code: str, message: str, hints: list[str] | None = None):
         super().__init__(message)
@@ -263,6 +271,235 @@ def run_command(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
 def require_tool(name: str) -> None:
     if shutil.which(name) is None:
         raise AppError("missing_tool", f"缺少命令行工具：{name}。请确认它已安装并在 PATH 中。")
+
+
+def check_python_dependencies() -> DoctorCheck:
+    distributions = ("yt-dlp", "faster-whisper", "openai", "Pillow", "python-dotenv")
+    missing: list[str] = []
+    for distribution in distributions:
+        try:
+            importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            missing.append(distribution)
+    if missing:
+        return DoctorCheck(
+            "python_dependencies",
+            "fail",
+            f"缺少 Python 依赖：{', '.join(missing)}。",
+        )
+    return DoctorCheck(
+        "python_dependencies",
+        "pass",
+        f"{len(distributions)} 项 Python 依赖已安装。",
+    )
+
+
+def check_command_line_tool(name: str) -> DoctorCheck:
+    if shutil.which(name) is None:
+        return DoctorCheck(
+            f"tool_{name.replace('-', '_')}",
+            "fail",
+            f"缺少命令行工具：{name}。",
+        )
+    return DoctorCheck(
+        f"tool_{name.replace('-', '_')}",
+        "pass",
+        f"命令行工具 {name} 可用。",
+    )
+
+
+def check_output_writable(output: str) -> DoctorCheck:
+    output_path = Path(output).expanduser()
+    if output_path.exists() and not output_path.is_dir():
+        return DoctorCheck("output_writable", "fail", "输出路径已存在，但不是目录。")
+
+    # 只在最近的已有上级目录创建并立即删除探针文件，避免自检留下输出目录或业务产物。
+    probe_dir = output_path
+    while not probe_dir.exists() and probe_dir != probe_dir.parent:
+        probe_dir = probe_dir.parent
+    if not probe_dir.is_dir():
+        return DoctorCheck("output_writable", "fail", "找不到可用的输出目录上级路径。")
+
+    try:
+        file_descriptor, probe_name = tempfile.mkstemp(
+            prefix=".video-summary-doctor-",
+            dir=probe_dir,
+        )
+        os.close(file_descriptor)
+        Path(probe_name).unlink()
+    except OSError:
+        return DoctorCheck("output_writable", "fail", "输出目录不可写。")
+    return DoctorCheck("output_writable", "pass", "输出目录可写。")
+
+
+def model_id_matches(configured_model: str, available_models: set[str]) -> bool:
+    configured = configured_model.casefold()
+    normalized = {item.casefold() for item in available_models}
+    if configured in normalized:
+        return True
+    return ":" not in configured and f"{configured}:latest" in normalized
+
+
+def probe_model_service(
+    *,
+    prefix: str,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout: float,
+    strict_model_listing: bool,
+) -> list[DoctorCheck]:
+    # 使用 OpenAI 兼容的模型列表接口完成轻量探测，避免自检触发有成本的推理请求。
+    request = urllib_request.Request(
+        f"{base_url.rstrip('/')}/models",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=min(timeout, 10)) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        model_listing_unavailable = exc.code in {404, 405, 501} or (
+            exc.code == 403 and not strict_model_listing
+        )
+        if model_listing_unavailable:
+            model_status = "fail" if strict_model_listing else "warn"
+            model_message = (
+                "服务不支持模型列表，无法确认本地目标模型。"
+                if strict_model_listing
+                else "API 服务不支持模型列表，已跳过目标模型确认。"
+            )
+            return [
+                DoctorCheck(f"{prefix}_service", "pass", "模型服务可连接。"),
+                DoctorCheck(f"{prefix}_model", model_status, model_message),
+            ]
+        if exc.code in {401, 403}:
+            message = "模型服务拒绝身份验证。"
+        else:
+            message = f"模型服务返回 HTTP {exc.code}。"
+        return [DoctorCheck(f"{prefix}_service", "fail", message)]
+    except (urllib_error.URLError, TimeoutError, OSError):
+        return [DoctorCheck(f"{prefix}_service", "fail", "无法连接模型服务。")]
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        model_status = "fail" if strict_model_listing else "warn"
+        return [
+            DoctorCheck(f"{prefix}_service", "pass", "模型服务可连接。"),
+            DoctorCheck(
+                f"{prefix}_model",
+                model_status,
+                "模型列表响应无法识别，未能确认目标模型。",
+            ),
+        ]
+
+    model_items = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(model_items, list):
+        model_status = "fail" if strict_model_listing else "warn"
+        return [
+            DoctorCheck(f"{prefix}_service", "pass", "模型服务可连接。"),
+            DoctorCheck(
+                f"{prefix}_model",
+                model_status,
+                "模型列表响应不兼容，未能确认目标模型。",
+            ),
+        ]
+
+    available_models = {
+        item["id"]
+        for item in model_items
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    model_check = (
+        DoctorCheck(f"{prefix}_model", "pass", f"目标模型 {model} 可用。")
+        if model_id_matches(model, available_models)
+        else DoctorCheck(f"{prefix}_model", "fail", f"未找到目标模型 {model}。")
+    )
+    return [
+        DoctorCheck(f"{prefix}_service", "pass", "模型服务可连接。"),
+        model_check,
+    ]
+
+
+def summarize_doctor_checks(checks: list[DoctorCheck]) -> dict[str, int]:
+    return {
+        status: sum(check.status == status for check in checks)
+        for status in ("pass", "warn", "fail")
+    }
+
+
+def run_doctor(args: argparse.Namespace) -> int:
+    checks = [check_python_dependencies()]
+    checks.extend(check_command_line_tool(name) for name in ("yt-dlp", "ffmpeg", "ffprobe"))
+    checks.append(check_output_writable(args.output))
+
+    try:
+        summary_config = resolve_summary_config(args.summary_provider)
+    except AppError as exc:
+        checks.append(DoctorCheck("summary_config", "fail", exc.message))
+    else:
+        checks.append(
+            DoctorCheck(
+                "summary_config",
+                "pass",
+                f"总结模型配置有效：{summary_config.provider} / {summary_config.model}。",
+            )
+        )
+        checks.extend(
+            probe_model_service(
+                prefix="summary",
+                api_key=summary_config.api_key,
+                base_url=summary_config.base_url,
+                model=summary_config.model,
+                timeout=summary_config.timeout,
+                strict_model_listing=summary_config.provider == "ollama",
+            )
+        )
+
+    if args.with_vision:
+        try:
+            vision_config = resolve_vision_config()
+        except AppError as exc:
+            checks.append(DoctorCheck("vision_config", "fail", exc.message))
+        else:
+            checks.append(
+                DoctorCheck(
+                    "vision_config",
+                    "pass",
+                    f"视觉模型配置有效：{vision_config.model}。",
+                )
+            )
+            checks.extend(
+                probe_model_service(
+                    prefix="vision",
+                    api_key=vision_config.api_key,
+                    base_url=vision_config.base_url,
+                    model=vision_config.model,
+                    timeout=vision_config.timeout,
+                    strict_model_listing=True,
+                )
+            )
+
+    summary = summarize_doctor_checks(checks)
+    ok = summary["fail"] == 0
+    if args.json:
+        print_json(
+            {
+                "ok": ok,
+                "mode": "doctor",
+                "checks": [asdict(check) for check in checks],
+                "summary": summary,
+            }
+        )
+    else:
+        print(f"环境自检：{'通过' if ok else '失败'}")
+        for check in checks:
+            print(f"[{check.status.upper()}] {check.id}: {check.message}")
+        print(
+            f"结果：{summary['pass']} 通过，{summary['warn']} 警告，"
+            f"{summary['fail']} 失败。"
+        )
+    return 0 if ok else 1
 
 
 def safe_name(value: str) -> str:
@@ -2395,6 +2632,7 @@ def call_llm(client, model: str, prompt: str, max_tokens: int | None = None) -> 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="支持快速解析和多模态解析的视频总结 CLI")
     parser.add_argument("url", nargs="?", help="视频链接，或容器/本机可访问的本地音视频文件路径")
+    parser.add_argument("--doctor", action="store_true", help="检查运行环境、模型配置和服务连通性，不处理视频")
     parser.add_argument("--output", default="outputs", help="输出目录，默认 outputs")
     parser.add_argument("--model-size", default="small", choices=AVAILABLE_MODEL_SIZES, help="faster-whisper 模型大小，默认 small")
     parser.add_argument("--language", default="zh", help="Whisper 识别语言；中文视频用 zh，英文视频建议 en，不确定可用 auto；默认 zh")
@@ -2435,6 +2673,8 @@ def main() -> int:
     run_started = time.monotonic()
     load_dotenv()
     args = parse_args()
+    if args.doctor:
+        return run_doctor(args)
     prompt_template = load_prompt_template(args.prompt, args.prompt_file)
     whisper_language = normalize_language(args.language)
     processing, options = build_processing_info(args, whisper_language)
