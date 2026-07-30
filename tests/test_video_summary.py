@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -6,7 +7,9 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from urllib import error as urllib_error
 from unittest.mock import patch
 
 
@@ -16,6 +19,20 @@ if importlib.util.find_spec("dotenv") is None:
     sys.modules["dotenv"] = dotenv
 
 import video_summary
+
+
+class JsonResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
 
 
 class ArgumentTests(unittest.TestCase):
@@ -94,6 +111,274 @@ class ArgumentTests(unittest.TestCase):
             video_summary.resolve_summary_config("api")
 
         self.assertEqual(context.exception.code, "missing_openai_api_key")
+
+
+class DoctorTests(unittest.TestCase):
+    def test_doctor_does_not_require_video_url_or_enter_pipeline(self):
+        args = video_summary.parse_args(["--doctor"])
+
+        with patch.object(video_summary, "load_dotenv"), patch.object(
+            video_summary, "parse_args", return_value=args
+        ), patch.object(
+            video_summary, "run_doctor", return_value=0
+        ) as run_doctor, patch.object(
+            video_summary, "load_prompt_template"
+        ) as load_prompt:
+            result = video_summary.main()
+
+        self.assertEqual(result, 0)
+        self.assertIsNone(args.url)
+        run_doctor.assert_called_once_with(args)
+        load_prompt.assert_not_called()
+
+    def test_normal_mode_still_requires_video_url(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            args = video_summary.parse_args(
+                ["--no-llm", "--output", str(Path(temp_name) / "outputs")]
+            )
+            stderr = io.StringIO()
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary, "parse_args", return_value=args
+            ), patch.object(video_summary.sys, "stderr", stderr):
+                result = video_summary.main()
+
+        self.assertEqual(result, 1)
+        self.assertIn("请提供视频链接", stderr.getvalue())
+
+    def test_python_dependency_check_reports_missing_distribution(self):
+        def resolve_version(distribution):
+            if distribution == "openai":
+                raise video_summary.importlib.metadata.PackageNotFoundError
+            return "1.0"
+
+        with patch.object(
+            video_summary.importlib.metadata,
+            "version",
+            side_effect=resolve_version,
+        ):
+            check = video_summary.check_python_dependencies()
+
+        self.assertEqual(check.status, "fail")
+        self.assertIn("openai", check.message)
+
+    def test_command_line_tool_check_reports_missing_tool(self):
+        with patch.object(video_summary.shutil, "which", return_value=None):
+            check = video_summary.check_command_line_tool("ffmpeg")
+
+        self.assertEqual(check.id, "tool_ffmpeg")
+        self.assertEqual(check.status, "fail")
+
+    def test_output_writable_check_passes_without_creating_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            output = Path(temp_name) / "not-created" / "outputs"
+
+            check = video_summary.check_output_writable(str(output))
+
+            self.assertEqual(check.status, "pass")
+            self.assertFalse(output.exists())
+            self.assertEqual(list(Path(temp_name).iterdir()), [])
+
+    def test_output_writable_check_reports_write_failure(self):
+        with tempfile.TemporaryDirectory() as temp_name, patch.object(
+            video_summary.tempfile,
+            "mkstemp",
+            side_effect=PermissionError,
+        ):
+            check = video_summary.check_output_writable(temp_name)
+
+        self.assertEqual(check.status, "fail")
+
+    def test_model_probe_passes_when_target_model_exists(self):
+        with patch.object(
+            video_summary.urllib_request,
+            "urlopen",
+            return_value=JsonResponse({"data": [{"id": "qwen:latest"}]}),
+        ):
+            checks = video_summary.probe_model_service(
+                prefix="summary",
+                api_key="secret",
+                base_url="http://service.test/v1",
+                model="qwen",
+                timeout=300,
+                strict_model_listing=True,
+            )
+
+        self.assertEqual([check.status for check in checks], ["pass", "pass"])
+
+    def test_model_probe_fails_when_local_target_model_is_missing(self):
+        with patch.object(
+            video_summary.urllib_request,
+            "urlopen",
+            return_value=JsonResponse({"data": [{"id": "other-model"}]}),
+        ):
+            checks = video_summary.probe_model_service(
+                prefix="summary",
+                api_key="secret",
+                base_url="http://service.test/v1",
+                model="qwen",
+                timeout=300,
+                strict_model_listing=True,
+            )
+
+        self.assertEqual(checks[-1].status, "fail")
+        self.assertIn("qwen", checks[-1].message)
+
+    def test_api_without_model_listing_is_warning(self):
+        for status_code in (403, 404):
+            with self.subTest(status_code=status_code):
+                error = urllib_error.HTTPError(
+                    "https://api.example.test/v1/models",
+                    status_code,
+                    "model listing unavailable",
+                    {},
+                    None,
+                )
+                with patch.object(
+                    video_summary.urllib_request,
+                    "urlopen",
+                    side_effect=error,
+                ):
+                    checks = video_summary.probe_model_service(
+                        prefix="summary",
+                        api_key="secret",
+                        base_url="https://api.example.test/v1",
+                        model="cloud-model",
+                        timeout=300,
+                        strict_model_listing=False,
+                    )
+
+                self.assertEqual(
+                    [check.status for check in checks],
+                    ["pass", "warn"],
+                )
+
+    def test_model_probe_reports_connection_failure_without_exception_details(self):
+        secret = "secret-value-that-must-not-leak"
+        with patch.object(
+            video_summary.urllib_request,
+            "urlopen",
+            side_effect=urllib_error.URLError(secret),
+        ):
+            checks = video_summary.probe_model_service(
+                prefix="summary",
+                api_key=secret,
+                base_url="http://private-host.test/v1",
+                model="qwen",
+                timeout=300,
+                strict_model_listing=True,
+            )
+
+        serialized = json.dumps(
+            [video_summary.asdict(check) for check in checks],
+            ensure_ascii=False,
+        )
+        self.assertEqual(checks[0].status, "fail")
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("private-host", serialized)
+
+    def test_doctor_only_checks_vision_when_requested(self):
+        summary_config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://summary.test/v1",
+            model="summary-model",
+            timeout=30,
+        )
+        vision_config = video_summary.VisionConfig(
+            api_key="ollama",
+            base_url="http://vision.test/v1",
+            model="vision-model",
+            timeout=30,
+        )
+
+        def probe(**kwargs):
+            prefix = kwargs["prefix"]
+            return [video_summary.DoctorCheck(f"{prefix}_service", "pass", "可用")]
+
+        common_patches = [
+            patch.object(
+                video_summary,
+                "check_python_dependencies",
+                return_value=video_summary.DoctorCheck("python_dependencies", "pass", "可用"),
+            ),
+            patch.object(
+                video_summary,
+                "check_command_line_tool",
+                side_effect=lambda name: video_summary.DoctorCheck(f"tool_{name}", "pass", "可用"),
+            ),
+            patch.object(
+                video_summary,
+                "check_output_writable",
+                return_value=video_summary.DoctorCheck("output_writable", "pass", "可用"),
+            ),
+            patch.object(video_summary, "resolve_summary_config", return_value=summary_config),
+            patch.object(video_summary, "resolve_vision_config", return_value=vision_config),
+            patch.object(video_summary, "probe_model_service", side_effect=probe),
+        ]
+        for doctor_args, expected_calls in (
+            (video_summary.parse_args(["--doctor"]), 1),
+            (video_summary.parse_args(["--doctor", "--with-vision"]), 2),
+        ):
+            with self.subTest(with_vision=doctor_args.with_vision):
+                active = [item.start() for item in common_patches]
+                try:
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = video_summary.run_doctor(doctor_args)
+                    self.assertEqual(result, 0)
+                    self.assertEqual(active[-1].call_count, expected_calls)
+                finally:
+                    for item in reversed(common_patches):
+                        item.stop()
+
+    def test_doctor_outputs_redact_sensitive_values_and_json_has_stable_shape(self):
+        secret = "doctor-secret"
+        private_host = "private-host.test"
+        config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key=secret,
+            base_url=f"http://{private_host}/v1",
+            model="qwen",
+            timeout=30,
+        )
+        passing = video_summary.DoctorCheck("check", "pass", "可用")
+        for json_output in (False, True):
+            with self.subTest(json=json_output):
+                argv = ["--doctor", "--json"] if json_output else ["--doctor"]
+                args = video_summary.parse_args(argv)
+                with patch.object(
+                    video_summary, "check_python_dependencies", return_value=passing
+                ), patch.object(
+                    video_summary, "check_command_line_tool", return_value=passing
+                ), patch.object(
+                    video_summary, "check_output_writable", return_value=passing
+                ), patch.object(
+                    video_summary, "resolve_summary_config", return_value=config
+                ), patch.object(
+                    video_summary.urllib_request,
+                    "urlopen",
+                    side_effect=urllib_error.URLError(f"{secret}@{private_host}"),
+                ):
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        result = video_summary.run_doctor(args)
+
+                serialized = output.getvalue()
+                self.assertEqual(result, 1)
+                self.assertNotIn(secret, serialized)
+                self.assertNotIn(private_host, serialized)
+                if json_output:
+                    payload = json.loads(serialized)
+                    self.assertFalse(payload["ok"])
+                    self.assertEqual(payload["mode"], "doctor")
+                    self.assertEqual(
+                        set(payload),
+                        {"ok", "mode", "checks", "summary"},
+                    )
+                    self.assertEqual(
+                        set(payload["summary"]),
+                        {"pass", "warn", "fail"},
+                    )
 
 
 class SubtitleTests(unittest.TestCase):
