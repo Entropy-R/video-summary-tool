@@ -195,11 +195,16 @@ docker compose run --rm video-summary --summary-from-file /app/outputs/example/t
 
 ### 6. 启用图片/画面阅读（多模态解析）
 
-当前方案要求 macOS 14 或更高版本。在 macOS 宿主机安装并启动 Ollama，然后拉取模型：
+多模态流程已在 macOS 14 及更高版本、Windows 10 + Docker Desktop（Linux 容器）
+完成实测。在宿主机安装并启动 Ollama，然后拉取模型：
 
 ```bash
 ollama pull qwen3-vl:8b-instruct-q4_K_M
 ```
+
+Windows 运行前还需启动 Docker Desktop。容器默认通过
+`http://host.docker.internal:11434/v1` 访问宿主机 Ollama；如果自检提示服务不可连接，
+先确认 Ollama 正在运行，再检查 Docker Desktop 和本机防火墙设置。
 
 `.env` 中配置：
 

@@ -1127,7 +1127,9 @@ class VisionOutputTests(unittest.TestCase):
                 1,
                 analysis_signature="analysis-signature",
             )
-            artifact = video_summary.parse_json_object((output_dir / "visual_context.json").read_text())
+            artifact = video_summary.parse_json_object(
+                (output_dir / "visual_context.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(results[0]["description"], "首页")
         self.assertEqual(artifact["status"], "completed")
@@ -1191,7 +1193,9 @@ class VisionOutputTests(unittest.TestCase):
 
             with patch.object(video_summary.time, "sleep"), self.assertRaises(video_summary.AppError):
                 video_summary.analyze_keyframes(client, config, frames, output_dir, 1)
-            artifact = video_summary.parse_json_object((output_dir / "visual_context.json").read_text())
+            artifact = video_summary.parse_json_object(
+                (output_dir / "visual_context.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(artifact["status"], "failed")
         self.assertIn("model stopped", artifact["error"])
@@ -1297,7 +1301,7 @@ class VisionOutputTests(unittest.TestCase):
                 2,
             )
             artifact = video_summary.parse_json_object(
-                (output_dir / "visual_context.json").read_text()
+                (output_dir / "visual_context.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(len(results), 2)
@@ -1348,7 +1352,7 @@ class VisionOutputTests(unittest.TestCase):
                 4,
             )
             artifact = video_summary.parse_json_object(
-                (output_dir / "visual_context.json").read_text()
+                (output_dir / "visual_context.json").read_text(encoding="utf-8")
             )
 
         self.assertEqual(len(results), 6)
