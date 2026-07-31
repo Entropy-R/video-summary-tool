@@ -37,6 +37,11 @@ GENERATED_OUTPUT_FILES = (
     "visual_context.md",
     "multimodal_context.txt",
 )
+VISUAL_OUTPUT_FILES = (
+    "visual_context.json",
+    "visual_context.md",
+    "multimodal_context.txt",
+)
 CACHE_FILE_NAME = "pipeline_cache.json"
 CACHE_SCHEMA_VERSION = 1
 MIN_VISUAL_CONTEXT_CHARS = 800
@@ -714,6 +719,31 @@ def clean_generated_outputs(output_dir: Path, *, clear_cache: bool = False) -> N
         (output_dir / CACHE_FILE_NAME).unlink(missing_ok=True)
 
 
+def clean_incompatible_outputs(
+    output_dir: Path,
+    *,
+    with_vision: bool,
+    produces_summary: bool,
+) -> None:
+    """只删除当前模式不会生成的旧产物，阶段缓存和可复用结果保持不变。"""
+    (output_dir / "chatgpt_prompt.md").unlink(missing_ok=True)
+    if not with_vision:
+        for name in VISUAL_OUTPUT_FILES:
+            (output_dir / name).unlink(missing_ok=True)
+    else:
+        # 多模态时间轴会根据本次转写和视觉结果重建，不参与断点续跑。
+        (output_dir / "multimodal_context.txt").unlink(missing_ok=True)
+    if not produces_summary:
+        (output_dir / "summary.md").unlink(missing_ok=True)
+
+
+def clean_failed_outputs(output_dir: Path, *, vision_completed: bool) -> None:
+    """失败运行不得留下可被误认为本次成功结果的摘要或多模态时间轴。"""
+    (output_dir / "summary.md").unlink(missing_ok=True)
+    if not vision_completed:
+        (output_dir / "multimodal_context.txt").unlink(missing_ok=True)
+
+
 def load_pipeline_cache(output_dir: Path) -> dict:
     path = output_dir / CACHE_FILE_NAME
     if not path.is_file():
@@ -922,7 +952,7 @@ def create_summary_client(config: SummaryConfig):
             [f"确认 Ollama 已启动，并能从当前运行环境访问 {config.base_url}。"],
         ) from exc
     available = {item.id for item in models.data}
-    if config.model not in available:
+    if not model_id_matches(config.model, available):
         raise AppError(
             "summary_model_not_found",
             f"Ollama 中未找到总结模型：{config.model}",
@@ -1684,7 +1714,7 @@ def create_vision_client(config: VisionConfig):
         ) from exc
 
     available = {item.id for item in models.data}
-    if config.model not in available:
+    if not model_id_matches(config.model, available):
         raise AppError(
             "vision_model_not_found",
             f"Ollama 中未找到视觉模型：{config.model}",
@@ -2775,6 +2805,11 @@ def main() -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         if not args.resume:
             clean_generated_outputs(output_dir, clear_cache=True)
+        clean_incompatible_outputs(
+            output_dir,
+            with_vision=args.with_vision,
+            produces_summary=not (args.no_llm or args.export_prompt),
+        )
         pipeline_cache = load_pipeline_cache(output_dir)
         pipeline_source_signature = source_signature(meta, local_input if is_local_file else None)
         transcript_cache_signature = stable_signature(
@@ -2818,6 +2853,13 @@ def main() -> int:
                     "prompt_schema": 3,
                 }
             )
+            if not load_visual_results(
+                output_dir,
+                vision_config.model,
+                vision_cache_signature,
+            ):
+                for name in ("visual_context.json", "visual_context.md"):
+                    (output_dir / name).unlink(missing_ok=True)
             processing["vision"] = {
                 "model": vision_config.model,
                 "status": "preparing",
@@ -2841,18 +2883,21 @@ def main() -> int:
 
         transcript_path = output_dir / "transcript.txt"
         transcript: str | None = None
-        if (
+        transcript_cache_valid = bool(
             args.resume
             and transcript_cache_signature
             and cache_stage_matches(pipeline_cache, "transcript", transcript_cache_signature)
             and transcript_path.is_file()
-        ):
+        )
+        if transcript_cache_valid:
             transcript = transcript_path.read_text(encoding="utf-8")
             transcript_stage = pipeline_cache["stages"]["transcript"]
             transcript_source = transcript_stage.get("source") or "unknown"
             whisper_context_terms = transcript_stage.get("whisper_context_terms")
             restore_cached_subtitle_metadata(transcript_stage, meta, warnings)
             processing.setdefault("cache_hits", []).append("transcript")
+        else:
+            transcript_path.unlink(missing_ok=True)
 
         subtitle_path = None
         if transcript is None and not is_local_file and not args.force_transcribe:
@@ -3117,13 +3162,15 @@ def main() -> int:
             }
         )
         summary_result: SummaryResult | None = None
-        if (
+        summary_cache_valid = bool(
             args.resume
             and cache_stage_matches(pipeline_cache, "summary", summary_cache_signature)
             and summary_path.is_file()
-        ):
+        )
+        if summary_cache_valid:
             processing.setdefault("cache_hits", []).append("summary")
         else:
+            summary_path.unlink(missing_ok=True)
             stage_started = time.monotonic()
             summary_result = summarize_with_llm(
                 summary_client,
@@ -3202,6 +3249,14 @@ def main() -> int:
     except AppError as exc:
         processing["status"] = "failed"
         processing["error"] = {"code": exc.code, "message": exc.message}
+        if output_dir:
+            clean_failed_outputs(
+                output_dir,
+                vision_completed=bool(
+                    processing.get("vision")
+                    and processing["vision"].get("status") == "completed"
+                ),
+            )
         if (
             args.with_vision
             and processing.get("vision")
@@ -3262,6 +3317,14 @@ def main() -> int:
     except Exception as exc:
         processing["status"] = "failed"
         processing["error"] = {"code": "unexpected_error", "message": str(exc)}
+        if output_dir:
+            clean_failed_outputs(
+                output_dir,
+                vision_completed=bool(
+                    processing.get("vision")
+                    and processing["vision"].get("status") == "completed"
+                ),
+            )
         if (
             args.with_vision
             and processing.get("vision")
