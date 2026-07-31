@@ -381,6 +381,192 @@ class DoctorTests(unittest.TestCase):
                     )
 
 
+class ModelClientTests(unittest.TestCase):
+    @staticmethod
+    def fake_openai_module(client):
+        module = types.ModuleType("openai")
+        module.OpenAI = lambda **_kwargs: client
+        return module
+
+    def test_summary_client_accepts_implicit_latest_model(self):
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                list=lambda: types.SimpleNamespace(
+                    data=[types.SimpleNamespace(id="qwen:latest")]
+                )
+            )
+        )
+        config = video_summary.SummaryConfig(
+            provider="ollama",
+            api_key="ollama",
+            base_url="http://service.test/v1",
+            model="qwen",
+            timeout=30,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"openai": self.fake_openai_module(client)},
+        ), patch.object(video_summary, "ollama_request", return_value={}):
+            result = video_summary.create_summary_client(config)
+
+        self.assertIs(result, client)
+
+    def test_vision_client_accepts_implicit_latest_model(self):
+        client = types.SimpleNamespace(
+            models=types.SimpleNamespace(
+                list=lambda: types.SimpleNamespace(
+                    data=[types.SimpleNamespace(id="qwen:latest")]
+                )
+            )
+        )
+        config = video_summary.VisionConfig(
+            api_key="ollama",
+            base_url="http://service.test/v1",
+            model="qwen",
+            timeout=30,
+        )
+
+        with patch.dict(
+            sys.modules,
+            {"openai": self.fake_openai_module(client)},
+        ):
+            result = video_summary.create_vision_client(config)
+
+        self.assertIs(result, client)
+
+
+class OutputInvalidationTests(unittest.TestCase):
+    def test_quick_no_llm_run_removes_stale_summary_and_visual_outputs(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            for name in (
+                "summary.md",
+                "chatgpt_prompt.md",
+                "visual_context.json",
+                "visual_context.md",
+                "multimodal_context.txt",
+            ):
+                (output_dir / name).write_text("stale", encoding="utf-8")
+            (output_dir / "pipeline_cache.json").write_text(
+                '{"schema_version": 1, "stages": {}}',
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [
+                    str(local_video),
+                    "--no-llm",
+                    "--output",
+                    str(output_root),
+                ]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "transcribe_audio",
+                return_value="[00:00:00] current transcript",
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 0)
+            self.assertTrue((output_dir / "transcript.txt").is_file())
+            self.assertTrue((output_dir / "pipeline_cache.json").is_file())
+            for name in (
+                "summary.md",
+                "chatgpt_prompt.md",
+                "visual_context.json",
+                "visual_context.md",
+                "multimodal_context.txt",
+            ):
+                self.assertFalse((output_dir / name).exists(), name)
+
+    def test_failed_summary_removes_previous_successful_summary(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            (output_dir / "summary.md").write_text(
+                "stale summary",
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [str(local_video), "--output", str(output_root)]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+            summary_config = video_summary.SummaryConfig(
+                provider="api",
+                api_key="key",
+                base_url="https://api.example.test/v1",
+                model="summary-model",
+                timeout=30,
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                return_value=summary_config,
+            ), patch.object(
+                video_summary,
+                "create_summary_client",
+                return_value=object(),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "transcribe_audio",
+                return_value="[00:00:00] current transcript",
+            ), patch.object(
+                video_summary,
+                "summarize_with_llm",
+                side_effect=video_summary.AppError(
+                    "summary_failed",
+                    "总结失败",
+                ),
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse((output_dir / "summary.md").exists())
+            prompt = (output_dir / "chatgpt_prompt.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("current transcript", prompt)
+            self.assertNotIn("stale summary", prompt)
+
+
 class SubtitleTests(unittest.TestCase):
     def test_bilibili_ai_subtitle_language_and_type_are_detected_from_file(self):
         meta = video_summary.VideoMeta("video", "BV1", "https://www.bilibili.com/video/BV1")
