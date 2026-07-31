@@ -738,10 +738,27 @@ def clean_incompatible_outputs(
 
 
 def clean_failed_outputs(output_dir: Path, *, vision_completed: bool) -> None:
-    """失败运行不得留下可被误认为本次成功结果的摘要或多模态时间轴。"""
-    (output_dir / "summary.md").unlink(missing_ok=True)
+    """失败运行不得留下未完成的多模态时间轴；摘要由签名失效点负责清理。"""
     if not vision_completed:
         (output_dir / "multimodal_context.txt").unlink(missing_ok=True)
+
+
+def write_text_atomic(path: Path, content: str) -> None:
+    """在目标目录写完临时文件后原子替换，避免 Windows 写入中断留下半文件。"""
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def load_pipeline_cache(output_dir: Path) -> dict:
@@ -2737,11 +2754,6 @@ def main() -> int:
 
     try:
         validate_args(args)
-        if not (args.no_llm or args.export_prompt or args.summary_from_file):
-            stage_started = time.monotonic()
-            summary_config = resolve_summary_config(args.summary_provider)
-            summary_client = create_summary_client(summary_config)
-            mark_stage(processing, "summary_preflight", stage_started)
         output_root = Path(args.output).resolve()
         output_root.mkdir(parents=True, exist_ok=True)
 
@@ -2822,11 +2834,43 @@ def main() -> int:
                 "cookies": cookie_cache_identity(cookies),
             }
         )
+        transcript_path = output_dir / "transcript.txt"
+        transcript: str | None = None
+        transcript_cache_valid = bool(
+            args.resume
+            and transcript_cache_signature
+            and cache_stage_matches(pipeline_cache, "transcript", transcript_cache_signature)
+            and transcript_path.is_file()
+        )
+        if transcript_cache_valid:
+            transcript = transcript_path.read_text(encoding="utf-8")
+            transcript_stage = pipeline_cache["stages"]["transcript"]
+            transcript_source = transcript_stage.get("source") or "unknown"
+            whisper_context_terms = transcript_stage.get("whisper_context_terms")
+            restore_cached_subtitle_metadata(transcript_stage, meta, warnings)
+            processing.setdefault("cache_hits", []).append("transcript")
+        else:
+            # 转写签名失效后，下游摘要也不再代表本次输入。
+            transcript_path.unlink(missing_ok=True)
+            (output_dir / "summary.md").unlink(missing_ok=True)
+
+        if not (args.no_llm or args.export_prompt):
+            try:
+                summary_config = resolve_summary_config(args.summary_provider)
+            except Exception:
+                # 配置无法解析时不能证明旧摘要仍属于本次请求。
+                (output_dir / "summary.md").unlink(missing_ok=True)
+                raise
         write_meta(meta, output_dir, None, warnings, processing, options)
 
         if args.with_vision:
-            stage_started = time.monotonic()
-            vision_config = resolve_vision_config()
+            try:
+                vision_config = resolve_vision_config()
+            except Exception:
+                for name in VISUAL_OUTPUT_FILES:
+                    (output_dir / name).unlink(missing_ok=True)
+                (output_dir / "summary.md").unlink(missing_ok=True)
+                raise
             vision_sampling_plan = build_vision_sampling_plan(
                 meta.duration,
                 args.vision_scan_interval,
@@ -2860,6 +2904,8 @@ def main() -> int:
             ):
                 for name in ("visual_context.json", "visual_context.md"):
                     (output_dir / name).unlink(missing_ok=True)
+                # 视觉结果签名失效时，旧的多模态摘要也必须重建。
+                (output_dir / "summary.md").unlink(missing_ok=True)
             processing["vision"] = {
                 "model": vision_config.model,
                 "status": "preparing",
@@ -2867,8 +2913,6 @@ def main() -> int:
                 "sampling": asdict(vision_sampling_plan),
             }
             write_meta(meta, output_dir, None, warnings, processing, options)
-            vision_client = create_vision_client(vision_config)
-            mark_stage(processing, "vision_preflight", stage_started)
             keyframes = load_cached_keyframes(pipeline_cache, keyframe_cache_signature, output_dir)
             if keyframes:
                 processing.setdefault("cache_hits", []).append("keyframes")
@@ -2880,24 +2924,6 @@ def main() -> int:
                 downloaded_vision_video = True
                 mark_stage(processing, "download_video", stage_started)
             write_meta(meta, output_dir, None, warnings, processing, options)
-
-        transcript_path = output_dir / "transcript.txt"
-        transcript: str | None = None
-        transcript_cache_valid = bool(
-            args.resume
-            and transcript_cache_signature
-            and cache_stage_matches(pipeline_cache, "transcript", transcript_cache_signature)
-            and transcript_path.is_file()
-        )
-        if transcript_cache_valid:
-            transcript = transcript_path.read_text(encoding="utf-8")
-            transcript_stage = pipeline_cache["stages"]["transcript"]
-            transcript_source = transcript_stage.get("source") or "unknown"
-            whisper_context_terms = transcript_stage.get("whisper_context_terms")
-            restore_cached_subtitle_metadata(transcript_stage, meta, warnings)
-            processing.setdefault("cache_hits", []).append("transcript")
-        else:
-            transcript_path.unlink(missing_ok=True)
 
         subtitle_path = None
         if transcript is None and not is_local_file and not args.force_transcribe:
@@ -3021,7 +3047,7 @@ def main() -> int:
         summary_source = transcript_source
         summary_prompt_template = prompt_template
         if args.with_vision:
-            if not vision_config or not vision_client or not keyframes:
+            if not vision_config or not keyframes:
                 raise AppError("vision_not_ready", "视觉解析环境没有正确初始化。")
             processing["vision"]["frames"] = len(keyframes)
             processing["vision"]["status"] = "analyzing"
@@ -3048,6 +3074,11 @@ def main() -> int:
                 visual_frames = existing_visual_results
                 processing.setdefault("cache_hits", []).append("vision")
             else:
+                # 部分视觉缓存不能支撑旧的多模态摘要，预检服务前先失效摘要。
+                (output_dir / "summary.md").unlink(missing_ok=True)
+                stage_started = time.monotonic()
+                vision_client = create_vision_client(vision_config)
+                mark_stage(processing, "vision_preflight", stage_started)
                 stage_started = time.monotonic()
                 visual_frames = analyze_keyframes(
                     vision_client,
@@ -3146,7 +3177,7 @@ def main() -> int:
             return 0
 
         summary_path = output_dir / "summary.md"
-        if not summary_config or not summary_client or summary_input is None or summary_source is None:
+        if not summary_config or summary_input is None or summary_source is None:
             raise AppError("summary_not_ready", "最终总结模型没有正确初始化。")
         summary_cache_signature = stable_signature(
             {
@@ -3172,6 +3203,9 @@ def main() -> int:
         else:
             summary_path.unlink(missing_ok=True)
             stage_started = time.monotonic()
+            summary_client = create_summary_client(summary_config)
+            mark_stage(processing, "summary_preflight", stage_started)
+            stage_started = time.monotonic()
             summary_result = summarize_with_llm(
                 summary_client,
                 summary_config,
@@ -3182,7 +3216,7 @@ def main() -> int:
                 summary_prompt_template,
             )
             mark_stage(processing, "summarize", stage_started)
-            summary_path.write_text(summary_result.text.strip() + "\n", encoding="utf-8")
+            write_text_atomic(summary_path, summary_result.text.strip() + "\n")
             update_cache_stage(
                 pipeline_cache,
                 "summary",
