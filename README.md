@@ -6,17 +6,33 @@
 
 1. 优先用 `yt-dlp` 抓取字幕。
 2. 字幕不可用时，下载音频并用 `faster-whisper` 转写。
-3. 最后调用 OpenAI 兼容接口（例如 DeepSeek、OpenAI、OpenRouter 等）生成中文总结。
-4. 如果没有 API 额度，也可以导出 `chatgpt_prompt.md`，复制到 ChatGPT 手动总结。
+3. 默认不解析画面；显式使用 `--with-vision` 时，才会抽取关键帧并调用宿主机上的本地视觉模型。
+4. 默认调用宿主机 Ollama 中的 Qwen3-VL 生成中文总结；也可显式切换到 OpenAI 兼容 API。
+5. 如果没有 API 额度，也可以导出 `chatgpt_prompt.md`，复制到 ChatGPT 手动总结。
+
+新增的图片/画面阅读能力适合 PPT、代码、图表、软件界面和操作步骤较多的视频。它不是逐帧识别，
+而是按视频时长自适应筛选关键帧，将画面证据与完整语音/字幕按时间轴合并后再生成总结。
 
 适合这些场景：
 
 - 总结 B 站视频、YouTube 视频或其他 `yt-dlp` 支持的视频链接。
 - 总结本地音视频文件。
+- 阅读课程、录屏和产品演示中的 PPT、代码、图表、界面与关键操作画面。
 - 只生成转写稿，不调用大模型。
 - 把长视频转写成 prompt，手动发给 ChatGPT。
 
 推荐使用 Docker 运行，避免污染本地 Python 环境。
+
+## 解析模式
+
+| 模式 | 信息来源 | 适用场景 | 特点 |
+| --- | --- | --- | --- |
+| 快速解析（默认） | 平台字幕；没有字幕时使用 Whisper 转写语音 | 访谈、播客、口播、知识讲解等主要内容由讲述承载的视频 | 速度较快，但不会识别 PPT、代码、图表和操作画面，可能遗漏仅在画面中出现的信息。 |
+| 多模态解析 | 语音/字幕 + 关键帧画面 | 录屏教程、课程、演示、评测以及画面信息较多的视频 | 语音与画面都是重要证据，准确度通常更高，但会增加下载、抽帧和本地模型推理时间。 |
+
+快速解析并不表示视频画面本身不重要，而是明确采用“主要内容由语音或字幕承载”的处理假设。多模态解析中，
+语音/字幕主要提供讲述逻辑、观点和因果关系，画面主要提供屏幕文字、PPT、代码、图表、操作步骤和场景变化；
+最终总结会综合两类证据，发生冲突时保守标记不确定性。
 
 ## 路径说明
 
@@ -52,12 +68,50 @@ docker compose build
 copy .env.example .env
 ```
 
-编辑 `.env`，填入 OpenAI 兼容接口配置：
+默认总结也使用本机 Ollama。先安装 Ollama 并拉取模型：
 
-```text
-OPENAI_API_KEY=sk-...
-OPENAI_BASE_URL=https://api.deepseek.com
-OPENAI_MODEL=deepseek-v4-flash
+```bash
+ollama pull qwen3-vl:8b-instruct-q4_K_M
+```
+
+`.env.example` 已将最终总结配置为本地 Ollama。默认流程仍不下载或解析视频画面；只有显式使用
+`--with-vision` 时才会启用关键帧分析。
+
+默认文字模式：
+
+```powershell
+docker compose run --rm video-summary "视频链接或本地视频路径"
+```
+
+启用图片/画面阅读：
+
+```powershell
+docker compose run --rm video-summary "视频链接或本地视频路径" --with-vision
+```
+
+### 运行环境自检
+
+切换开发机器、修改模型配置或排查运行环境时，可以先执行自检。自检不会处理视频，也不会生成
+转写稿、总结或其他视频产物：
+
+```powershell
+docker compose run --rm video-summary --doctor
+```
+
+同时检查视觉模型：
+
+```powershell
+docker compose run --rm video-summary --doctor --with-vision
+```
+
+自检会检查 Python 依赖、`yt-dlp`、FFmpeg、FFprobe、输出目录写入权限、模型配置、服务连通性和
+目标模型。检查结果分为 `PASS`、`WARN`、`FAIL`；存在 `FAIL` 时退出码为 1，否则为 0。云端
+OpenAI 兼容 API 如果不支持模型列表接口，会显示 `WARN`，不会误判为服务不可用。
+
+需要交给脚本或 CI 读取时追加 `--json`：
+
+```powershell
+docker compose run --rm video-summary --doctor --with-vision --json
 ```
 
 ## 常用场景
@@ -85,7 +139,7 @@ docker compose run --rm video-summary "/app/outputs/local/demo.mp4"
 默认行为：
 
 - 使用 Whisper 转写，默认语言 `zh`
-- 调用 `.env` 里的大模型接口
+- 默认调用本机 Qwen3-VL 总结
 - 输出 `transcript.txt` 和 `summary.md`
 
 ### 2. 总结 B 站视频
@@ -139,15 +193,74 @@ docker compose run --rm video-summary --summary-from-file /app/outputs/example/t
 
 适合已经有 `transcript.txt`，不想重新下载或转写的情况。
 
+### 6. 启用图片/画面阅读（多模态解析）
+
+多模态流程已在 macOS 14 及更高版本、Windows 10 + Docker Desktop（Linux 容器）
+完成实测。在宿主机安装并启动 Ollama，然后拉取模型：
+
+```bash
+ollama pull qwen3-vl:8b-instruct-q4_K_M
+```
+
+Windows 运行前还需启动 Docker Desktop。容器默认通过
+`http://host.docker.internal:11434/v1` 访问宿主机 Ollama；如果自检提示服务不可连接，
+先确认 Ollama 正在运行，再检查 Docker Desktop 和本机防火墙设置。
+
+`.env` 中配置：
+
+```text
+VISION_API_KEY=ollama
+VISION_BASE_URL=http://host.docker.internal:11434/v1
+VISION_MODEL=qwen3-vl:8b-instruct-q4_K_M
+VISION_TIMEOUT=300
+```
+
+运行：
+
+```powershell
+docker compose run --rm video-summary "视频链接或本地视频路径" --with-vision
+```
+
+图片/画面阅读会执行以下步骤：
+
+1. 下载视频或读取本地文件，并完整保留字幕/Whisper 转写。
+2. 按视频时长扫描候选画面，结合镜头变化与相似度去重筛选关键帧。
+3. 使用本地 Qwen3-VL 读取画面描述和屏幕文字，并结合相邻语音校正 OCR。
+4. 将语音/字幕与画面证据按时间轴合并，最后生成包含“关键画面信息”的中文总结。
+
+多模态模式会根据视频时长自动计算候选帧密度和实际帧预算，并补充镜头变化帧。短视频保留基础覆盖，
+长视频约按每 30 秒增长一帧，最终受 `--vision-max-frames` 硬上限约束。画面差异去重会忽略边缘
+页眉、水印和播放器装饰；关键帧默认缩放到 768 像素宽，视觉模型每批分析 4 帧，并结合相邻字幕
+校正 OCR，只提取字幕之外的
+新增画面证据。原始图片不会发送给最终的文本总结接口。
+
+如果当前 Ollama 上下文无法一次处理默认批量，程序会自动拆成更小批次，并在后续请求中记住已经
+验证可用的批量。最终多模态材料会完整保留字幕，并根据总结模型的安全上下文限制视觉补充预算；
+短中视频会尽量使用单次总结，长视频仍采用均衡分段。
+
+成功后可重点查看：
+
+- `summary.md`：综合语音与画面生成的最终总结。
+- `visual_context.md`：按时间列出的关键画面描述，便于人工核对。
+- `multimodal_context.txt`：完整语音/字幕与画面证据合并后的时间轴材料。
+- `frames/run-*/`：筛选出的关键帧，仅用于调试和复核。
+
+图片仅发送给配置的视觉模型。默认配置使用宿主机 Ollama，本地处理图片；最终文本总结只接收已经
+生成的文字材料。首次运行需要下载 Whisper 模型，并可能花费较长时间，16 GB 内存机器建议保持
+单任务运行。
+
+为保证旧参数语义不变，`--with-vision` 暂不能与 `--no-llm`、`--export-prompt`、`--summary-from-file` 同时使用。
+
 ## B 站 Cookies
 
-B 站经常会对未登录或容器网络请求返回：
+B 站经常会对未登录或容器网络请求返回 412，或者只允许登录用户获取字幕：
 
 ```text
 HTTP Error 412: Precondition Failed
 ```
 
-这通常不是程序错误，而是缺少有效登录态。建议导出 cookies。
+这通常不是程序错误，而是缺少有效登录态。没有 cookies 时，即使视频网页上能看到 AI 字幕，
+`yt-dlp` 也可能只能获得弹幕轨道，程序将提示登录要求并回退到 Whisper。建议导出 cookies。
 
 默认 Docker 用法会自动尝试读取容器内的 `/app/cookies/cookies.txt`，所以宿主机项目目录下的文件名必须是：
 
@@ -220,6 +333,10 @@ outputs/
     transcript.txt
     summary.md
     chatgpt_prompt.md
+    visual_context.json
+    visual_context.md
+    multimodal_context.txt
+    frames/run-*/
     *.srt
 ```
 
@@ -231,6 +348,9 @@ outputs/
 | `transcript.txt` | 最终用于总结的文本。可能来自字幕，也可能来自 Whisper 转写；可识别时间时会保留为 `[00:01:23] 文本`。 |
 | `summary.md` | 大模型生成的中文总结。只有调用 LLM 成功时生成，默认会尽量按转写稿中的时间节点组织分段要点。 |
 | `chatgpt_prompt.md` | 可复制到 ChatGPT 的提示词。使用 `--export-prompt` 或 LLM 失败兜底时生成。 |
+| `visual_context.json` / `visual_context.md` | 视觉模式生成的带时间戳画面解析结果。 |
+| `multimodal_context.txt` | 按时间轴合并语音/字幕与画面描述的最终总结输入。 |
+| `frames/run-*/` | 视觉模式筛选出的关键帧；调试阶段默认保留。 |
 | `*.srt` | 下载到的字幕文件，如果视频有字幕才会出现。 |
 | `*.mp3` / `*.m4a` | 下载的音频文件。默认转写后删除，使用 `--keep-audio` 时保留。 |
 
@@ -244,7 +364,9 @@ outputs/
   "uploader": "up-name",
   "duration": 120,
   "subtitle_langs": [],
-  "automatic_caption_langs": [],
+  "automatic_caption_langs": ["ai-zh"],
+  "selected_subtitle_lang": "ai-zh",
+  "selected_subtitle_type": "automatic",
   "whisper_context_terms": ["LLaMA-Factory", "AI"],
   "transcript_source": "whisper",
   "warnings": []
@@ -267,10 +389,11 @@ outputs/
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
+| `--doctor` | `false` | 检查依赖、输出权限、模型配置和服务连通性，不处理视频。 |
 | `--output` | `outputs` | 输出目录。 |
 | `--model-size` | `small` | Whisper 模型大小，影响转写速度和准确率。 |
 | `--language` | `zh` | Whisper 识别语言。中文视频默认不用配置；英文视频建议传 `en`；中英文不确定或多语言内容可传 `auto`。 |
-| `--sub-langs` | `zh-Hans,zh-CN,zh,en` | 字幕语言优先级。 |
+| `--sub-langs` | `zh.*,ai-zh,en.*` | 字幕语言匹配规则，覆盖常见中文、B 站 AI 中文字幕和英文轨道。 |
 | `--cookies` | 自动尝试 `/app/cookies/cookies.txt` | cookies 文件路径。默认文件不存在时会忽略。 |
 | `--cookies-from-browser` | 空 | 从浏览器读取 cookies，例如 `edge`、`chrome`、`firefox`。Docker 中通常需要额外挂载浏览器 profile。 |
 | `--no-llm` | `false` | 只生成 `transcript.txt`，不调用大模型。 |
@@ -282,6 +405,14 @@ outputs/
 | `--prompt` | 空 | 直接传入自定义总结 prompt 模板文本。 |
 | `--prompt-file` | 空 | 从文件读取自定义总结 prompt 模板。 |
 | `--max-chars` | `12000` | LLM 或 prompt 分段最大字符数。 |
+| `--summary-provider` | `ollama` | 最终总结提供方；`api` 使用 `OPENAI_*` 配置。 |
+| `--no-resume` | `false` | 忽略阶段缓存，强制重新处理。 |
+| `--with-vision` | `false` | 启用多模态解析（语音/字幕 + 关键帧）；默认使用快速解析，仅处理语音/字幕。 |
+| `--vision-scan-interval` | `5` | 候选帧扫描间隔秒数。 |
+| `--vision-max-gap` | `45` | 自适应采样允许的相似画面最长保留间隔上限秒数。 |
+| `--vision-max-frames` | `60` | 单个视频最多解析的关键帧数。 |
+| `--vision-batch-size` | `4` | 每次视觉模型请求包含的图片数。 |
+| `--vision-frame-width` | `768` | 送入视觉模型前的关键帧宽度。 |
 
 ## Whisper 模型大小
 
@@ -316,7 +447,7 @@ distil-small.en, distil-medium.en, distil-large-v2, distil-large-v3
 
 这个过程默认启用，不需要额外参数。关键词只来自视频自身元数据，不使用固定内置词表；如果没有提取到有效关键词，就不会传上下文提示。实际使用的关键词会记录到 `meta.json` 的 `whisper_context_terms` 字段。视频有字幕时会优先使用字幕，这个 Whisper 上下文不会生效。
 
-## 运行元数据和旧产物
+## 运行元数据、缓存和断点续跑
 
 每次运行会在 `meta.json` 中记录本次参数和阶段耗时：
 
@@ -340,7 +471,9 @@ distil-small.en, distil-medium.en, distil-large-v2, distil-large-v3
 }
 ```
 
-如果同一个视频输出目录已经存在，程序会在本次运行开始前清理旧的 `transcript.txt`、`summary.md`、`chatgpt_prompt.md`，避免不同运行产生的旧结果混在一起。其他文件（例如字幕文件、手动放入的资料、保留的音频）不会被自动删除。
+程序默认在 `pipeline_cache.json` 中记录转写、关键帧、视觉解析和最终总结的签名。同一视频以相同参数重跑时，
+会复用已完成阶段；视觉处理中断后也会从缺失帧继续。修改模型、抽帧参数、总结模型或输入文件后，相应阶段会自动失效。
+需要全部重新处理时使用 `--no-resume`。调试用的 `frames/run-*/` 不会自动删除。
 
 ## Prompt 模板
 
@@ -381,17 +514,36 @@ docker compose run --rm video-summary "/app/outputs/local/demo.mp4" --prompt-fil
 
 ## 配置说明
 
-`.env.example` 默认使用 DeepSeek 兼容接口示例：
+`.env.example` 默认使用本机 Ollama 完成视觉解析和最终总结：
 
 ```text
+SUMMARY_PROVIDER=ollama
+SUMMARY_API_KEY=ollama
+SUMMARY_BASE_URL=http://host.docker.internal:11434/v1
+SUMMARY_MODEL=qwen3-vl:8b-instruct-q4_K_M
+SUMMARY_TIMEOUT=300
+SUMMARY_LOCAL_CHUNK_CHARS=auto
+SUMMARY_OLLAMA_CONTEXT_LENGTH=8192
 OPENAI_API_KEY=sk-...
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_MODEL=deepseek-v4-flash
+VISION_API_KEY=ollama
+VISION_BASE_URL=http://host.docker.internal:11434/v1
+VISION_MODEL=qwen3-vl:8b-instruct-q4_K_M
+VISION_TIMEOUT=300
 VIDEO_SUMMARY_COOKIES=
 VIDEO_SUMMARY_COOKIES_FROM_BROWSER=
 ```
 
-如果使用 OpenAI，把 `OPENAI_BASE_URL` 和 `OPENAI_MODEL` 改成对应值即可。
+需要调用云端 OpenAI 兼容接口时，设置 `SUMMARY_PROVIDER=api`，或者传入
+`--summary-provider api`，再配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL` 和 `OPENAI_MODEL`。
+程序不会在本地总结失败后自动调用云端接口，避免意外费用和数据外发。
+本地总结默认读取 Qwen 模型向 Ollama 声明的最大上下文，并在每次原生 Ollama 请求中显式设置
+`SUMMARY_OLLAMA_CONTEXT_LENGTH`（默认 8192）。程序会为提示词和输出预留空间，自动计算不超过
+当前上下文安全容量的分段；文本能安全放入一次请求时直接总结，超过时才均衡分段。若 Ollama返回
+上下文超限，程序会缩小分段后重试。需要固定分段时可把 `SUMMARY_LOCAL_CHUNK_CHARS` 设置为正整数。
+长分段的中间摘要会保留更充足的输出预算，避免为了减少调用次数而丢失分段后半部分。提高 Ollama
+上下文会增加内存占用。
 
 注意：`docker compose config` 会展开 `.env` 中的真实 API key，不要把它的输出截图或发到公开场合。
 
@@ -415,10 +567,17 @@ docker compose run --rm video-summary "/app/outputs/local/sample.mp4" --model-si
 docker compose run --rm video-summary "/app/outputs/local/sample.mp4" --model-size tiny --no-llm --json
 ```
 
+视觉连通和短视频验证：
+
+```powershell
+docker compose run --rm video-summary "/app/outputs/local/sample.mp4" --model-size tiny --with-vision --vision-max-frames 6
+```
+
 ## 注意事项
 
 - 首次 Whisper 转写会下载模型，模型缓存在 Docker volume `video_summary_cache`。
-- ChatGPT Plus 不等于 OpenAI API 额度；API 需要单独配置 billing。
+- Qwen3-VL 运行在宿主机 Ollama 中，不占用 Docker volume；16 GB 内存机器建议保持单任务运行。
+- 使用 `--summary-provider api` 时，ChatGPT Plus 不等于 OpenAI API 额度；API 需要单独配置 billing。
 - B 站链接可能需要 cookies、代理或换网络。
 - `.env`、`cookies/`、`outputs/` 已加入忽略列表，避免误提交敏感数据或产物。
 
