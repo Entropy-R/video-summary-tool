@@ -437,6 +437,34 @@ class ModelClientTests(unittest.TestCase):
 
 
 class OutputInvalidationTests(unittest.TestCase):
+    @staticmethod
+    def summary_config():
+        return video_summary.SummaryConfig(
+            provider="api",
+            api_key="key",
+            base_url="https://api.example.test/v1",
+            model="summary-model",
+            timeout=30,
+        )
+
+    @staticmethod
+    def write_cached_transcript(output_dir, text="[00:00:00] cached transcript"):
+        (output_dir / "transcript.txt").write_text(text, encoding="utf-8")
+        (output_dir / "pipeline_cache.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "stages": {
+                        "transcript": {
+                            "signature": "cached",
+                            "source": "whisper",
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_quick_no_llm_run_removes_stale_summary_and_visual_outputs(self):
         with tempfile.TemporaryDirectory() as temp_name:
             root = Path(temp_name)
@@ -520,13 +548,7 @@ class OutputInvalidationTests(unittest.TestCase):
                 str(local_video),
                 duration=15,
             )
-            summary_config = video_summary.SummaryConfig(
-                provider="api",
-                api_key="key",
-                base_url="https://api.example.test/v1",
-                model="summary-model",
-                timeout=30,
-            )
+            summary_config = self.summary_config()
 
             with patch.object(video_summary, "load_dotenv"), patch.object(
                 video_summary,
@@ -565,6 +587,410 @@ class OutputInvalidationTests(unittest.TestCase):
             )
             self.assertIn("current transcript", prompt)
             self.assertNotIn("stale summary", prompt)
+
+    def test_summary_preflight_failure_removes_invalid_previous_summary(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            (output_dir / "summary.md").write_text(
+                "stale summary",
+                encoding="utf-8",
+            )
+            (output_dir / "chatgpt_prompt.md").write_text(
+                "stale prompt",
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [str(local_video), "--output", str(output_root)]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                return_value=self.summary_config(),
+            ), patch.object(
+                video_summary,
+                "create_summary_client",
+                side_effect=video_summary.AppError(
+                    "summary_backend_unavailable",
+                    "总结服务不可用",
+                ),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "transcribe_audio",
+                return_value="[00:00:00] current transcript",
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse((output_dir / "summary.md").exists())
+            prompt = (output_dir / "chatgpt_prompt.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("current transcript", prompt)
+            self.assertNotIn("stale prompt", prompt)
+
+    def test_summary_config_failure_removes_previous_summary(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            self.write_cached_transcript(output_dir)
+            (output_dir / "summary.md").write_text(
+                "stale summary",
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [str(local_video), "--output", str(output_root)]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                side_effect=video_summary.AppError(
+                    "summary_config_invalid",
+                    "总结配置无效",
+                ),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "cache_stage_matches",
+                return_value=True,
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            self.assertFalse((output_dir / "summary.md").exists())
+
+    def test_vision_config_failure_removes_visual_outputs_and_summary(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            self.write_cached_transcript(output_dir)
+            for name in (*video_summary.VISUAL_OUTPUT_FILES, "summary.md"):
+                (output_dir / name).write_text("stale", encoding="utf-8")
+            args = video_summary.parse_args(
+                [
+                    str(local_video),
+                    "--with-vision",
+                    "--output",
+                    str(output_root),
+                ]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                return_value=self.summary_config(),
+            ), patch.object(
+                video_summary,
+                "resolve_vision_config",
+                side_effect=video_summary.AppError(
+                    "vision_config_invalid",
+                    "视觉配置无效",
+                ),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "cache_stage_matches",
+                return_value=True,
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            for name in (*video_summary.VISUAL_OUTPUT_FILES, "summary.md"):
+                self.assertFalse((output_dir / name).exists(), name)
+
+    def test_vision_preflight_runs_after_transcript_invalidation(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            output_dir.mkdir(parents=True)
+            (output_dir / "transcript.txt").write_text(
+                "stale transcript",
+                encoding="utf-8",
+            )
+            (output_dir / "summary.md").write_text(
+                "stale summary",
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [
+                    str(local_video),
+                    "--with-vision",
+                    "--output",
+                    str(output_root),
+                ]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+            vision_config = video_summary.VisionConfig(
+                api_key="ollama",
+                base_url="http://service.test/v1",
+                model="vision-model",
+                timeout=30,
+            )
+            frame = video_summary.FrameCandidate(
+                output_dir / "keyframes" / "frame.jpg",
+                0,
+                "scene",
+            )
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                return_value=self.summary_config(),
+            ), patch.object(
+                video_summary,
+                "resolve_vision_config",
+                return_value=vision_config,
+            ), patch.object(
+                video_summary,
+                "create_vision_client",
+                side_effect=video_summary.AppError(
+                    "vision_backend_unavailable",
+                    "视觉服务不可用",
+                ),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "transcribe_audio",
+                return_value="[00:00:00] current transcript",
+            ), patch.object(
+                video_summary,
+                "extract_keyframes",
+                return_value=[frame],
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 1)
+            self.assertEqual(
+                (output_dir / "transcript.txt").read_text(encoding="utf-8"),
+                "[00:00:00] current transcript",
+            )
+            self.assertFalse((output_dir / "summary.md").exists())
+
+    def test_failed_cleanup_preserves_summary_until_signature_is_invalid(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            summary_path = output_dir / "summary.md"
+            timeline_path = output_dir / "multimodal_context.txt"
+            summary_path.write_text("valid cached summary", encoding="utf-8")
+            timeline_path.write_text("incomplete timeline", encoding="utf-8")
+
+            video_summary.clean_failed_outputs(
+                output_dir,
+                vision_completed=False,
+            )
+
+            self.assertTrue(summary_path.is_file())
+            self.assertFalse(timeline_path.exists())
+
+    def test_atomic_text_write_removes_temporary_file_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            output_dir = Path(temp_name)
+            summary_path = output_dir / "summary.md"
+
+            with patch.object(
+                video_summary.os,
+                "replace",
+                side_effect=OSError("replace failed"),
+            ):
+                with self.assertRaises(OSError):
+                    video_summary.write_text_atomic(
+                        summary_path,
+                        "partial summary",
+                    )
+
+            self.assertFalse(summary_path.exists())
+            self.assertEqual(list(output_dir.glob(".summary.md.*.tmp")), [])
+
+    def test_complete_multimodal_cache_does_not_require_model_services(self):
+        with tempfile.TemporaryDirectory() as temp_name:
+            root = Path(temp_name)
+            local_video = root / "input.mp4"
+            local_video.write_bytes(b"video")
+            output_root = root / "outputs"
+            output_dir = output_root / "video"
+            keyframe_path = output_dir / "keyframes" / "frame.jpg"
+            keyframe_path.parent.mkdir(parents=True)
+            keyframe_path.write_bytes(b"frame")
+            (output_dir / "transcript.txt").write_text(
+                "[00:00:00] cached transcript",
+                encoding="utf-8",
+            )
+            summary_path = output_dir / "summary.md"
+            summary_path.write_text("valid cached summary", encoding="utf-8")
+            (output_dir / "pipeline_cache.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "stages": {
+                            "transcript": {
+                                "signature": "cached",
+                                "source": "whisper",
+                            },
+                            "summary": {
+                                "signature": "cached",
+                                "chunk_chars": 12000,
+                                "chunks": 1,
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = video_summary.parse_args(
+                [
+                    str(local_video),
+                    "--with-vision",
+                    "--output",
+                    str(output_root),
+                ]
+            )
+            meta = video_summary.VideoMeta(
+                "video",
+                "video",
+                str(local_video),
+                duration=15,
+            )
+            vision_config = video_summary.VisionConfig(
+                api_key="ollama",
+                base_url="http://service.test/v1",
+                model="vision-model",
+                timeout=30,
+            )
+            frame = video_summary.FrameCandidate(
+                keyframe_path,
+                0,
+                "scene",
+            )
+            visual_frames = [
+                {
+                    "timestamp_seconds": 0,
+                    "timestamp": "00:00:00",
+                    "image": "keyframes/frame.jpg",
+                    "frame_source": "scene",
+                    "description": "cached frame",
+                    "visible_text": "",
+                    "importance": "medium",
+                    "uncertainty": "",
+                }
+            ]
+
+            with patch.object(video_summary, "load_dotenv"), patch.object(
+                video_summary,
+                "parse_args",
+                return_value=args,
+            ), patch.object(
+                video_summary,
+                "resolve_summary_config",
+                return_value=self.summary_config(),
+            ), patch.object(
+                video_summary,
+                "resolve_vision_config",
+                return_value=vision_config,
+            ), patch.object(
+                video_summary,
+                "create_summary_client",
+                side_effect=AssertionError("不应连接总结服务"),
+            ), patch.object(
+                video_summary,
+                "create_vision_client",
+                side_effect=AssertionError("不应连接视觉服务"),
+            ), patch.object(
+                video_summary,
+                "load_local_meta",
+                return_value=meta,
+            ), patch.object(
+                video_summary,
+                "cache_stage_matches",
+                return_value=True,
+            ), patch.object(
+                video_summary,
+                "load_cached_keyframes",
+                return_value=[frame],
+            ), patch.object(
+                video_summary,
+                "load_visual_results",
+                return_value=visual_frames,
+            ), patch.object(
+                video_summary,
+                "visual_results_cover_frames",
+                return_value=True,
+            ):
+                result = video_summary.main()
+
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                summary_path.read_text(encoding="utf-8"),
+                "valid cached summary",
+            )
 
 
 class SubtitleTests(unittest.TestCase):
