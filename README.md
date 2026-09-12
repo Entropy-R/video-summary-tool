@@ -38,7 +38,7 @@
 
 README 中会同时出现两类路径：
 
-- **宿主机路径**：你在 Windows 上看到的路径，例如 `G:\code\video-summary\outputs\local\demo.mp4`。
+- **宿主机路径**：你在 Windows 上看到的路径，例如 `<project-root>\outputs\local\demo.mp4`。
 - **容器内路径**：Docker 容器里看到的路径，例如 `/app/outputs/local/demo.mp4`。
 
 `docker-compose.yml` 默认做了两组目录映射：
@@ -127,7 +127,7 @@ outputs/local/demo.mp4
 这表示宿主机项目目录下的：
 
 ```text
-G:\code\video-summary\outputs\local\demo.mp4
+<project-root>\outputs\local\demo.mp4
 ```
 
 运行：
@@ -153,7 +153,7 @@ cookies/cookies.txt
 这表示宿主机项目目录下的：
 
 ```text
-G:\code\video-summary\cookies\cookies.txt
+<project-root>\cookies\cookies.txt
 ```
 
 然后运行：
@@ -285,7 +285,7 @@ cookies/cookies.txt
 Windows 项目路径示例：
 
 ```text
-G:\code\video-summary\cookies\cookies.txt
+<project-root>\cookies\cookies.txt
 ```
 
 容器内路径会自动映射为：
@@ -301,13 +301,13 @@ G:\code\video-summary\cookies\cookies.txt
 Edge：
 
 ```powershell
-yt-dlp --cookies-from-browser edge --cookies G:\code\video-summary\cookies\cookies.txt --skip-download https://www.bilibili.com
+yt-dlp --cookies-from-browser edge --cookies .\cookies\cookies.txt --skip-download https://www.bilibili.com
 ```
 
 Chrome：
 
 ```powershell
-yt-dlp --cookies-from-browser chrome --cookies G:\code\video-summary\cookies\cookies.txt --skip-download https://www.bilibili.com
+yt-dlp --cookies-from-browser chrome --cookies .\cookies\cookies.txt --skip-download https://www.bilibili.com
 ```
 
 浏览器最好先完全退出，否则 cookies 数据库可能被锁。
